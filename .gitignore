@@ -1,2 +1,2 @@
-edfbrowser_bids/build/*
+!edfbrowser_bids/build/**/*
 .idx
