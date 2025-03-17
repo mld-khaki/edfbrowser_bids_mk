@@ -5589,12 +5589,3 @@ void UI_Mainwindow::open_edf_file(const QString &file_path)
     open_new_file();
 }
 
-
-
-
-
-
-
-
-
-
