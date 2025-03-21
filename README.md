@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://github.com/mld-khaki/edfbrowser_bids_mk/blob/main/edfbrowser_bids/images/splash.png" alt="EDFBrowser-BIDS"/>
+</p>
+
 # EDFBrowser-BIDS Pipeline Tool
 
 This repository is a modified version of the open-source **EDFBrowser**. It integrates BIDS (Brain Imaging Data Structure) tools and command-line functionality to support automated pipelines.
