@@ -193,13 +193,26 @@ int main(int argc, char *argv[])
       QString suffix = fileInfo.suffix().toLower();
       if(suffix == "edf" || suffix == "bdf" || suffix == "rec")
       {
-        // Use the drop_path mechanism of the MainWindow to open the file
-        MainWindow->cmdlineargument = 1;
-        strlcpy(MainWindow->drop_path, filePath.toLocal8Bit().data(), MAX_PATH_LENGTH);
+        // We need to use the public open_new_file() method
+        // The MainWindow has path variable and open_new_file() method to handle this
+        
+        // First, we need to make this file path available in MainWindow class
+        // We can do this by setting the window property
+        MainWindow->setProperty("pending_open_file", filePath);
+        
+        // Connect to a signal that will be emitted when the main window is shown
+        QObject::connect(MainWindow, &UI_Mainwindow::shown, 
+                        [MainWindow]() {
+                            QString pendingFile = MainWindow->property("pending_open_file").toString();
+                            if (!pendingFile.isEmpty()) {
+                                // Call the appropriate public method
+                                MainWindow->open_edf_file(pendingFile);
+                            }
+                        });
       }
       else
       {
-        fprintf(stderr, "Warning: File %s is not an EDF/BDF/REC file. Opening normally.\n", 
+        fprintf(stderr, "Warning: File %s is not an EDF/BDF/REC file.\n", 
                 filePath.toLocal8Bit().constData());
       }
     }
@@ -216,7 +229,10 @@ int main(int argc, char *argv[])
   return ret;
 }
 
-
-
+void UI_Mainwindow::showEvent(QShowEvent *event)
+{
+    QMainWindow::showEvent(event);
+    emit shown();
+}
 
 

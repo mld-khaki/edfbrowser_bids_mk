@@ -74,9 +74,12 @@ private:
 private slots:
 
   void CheckButtonClicked();
+  void CheckButtonClicked_prv();
 
 };
-
+int is_onset_number_free(char *str);
+int is_duration_number_free(char *str);
+int check_edf_compatibility(edfhdrblck_t *hdr, FILE *inputfile, char *errmsg, int errmsg_len);
 
 
 #endif // EDFCOMPATFORM1_H
