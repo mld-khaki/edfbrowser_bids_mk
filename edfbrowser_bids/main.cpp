@@ -47,10 +47,30 @@
 #include "mainwindow.h"
 #include "edf_compat.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+void attach_console_if_needed() {
+#ifdef _WIN32
+    // If no console exists, create one
+    if (AttachConsole(ATTACH_PARENT_PROCESS) == 0) {
+        AllocConsole();
+    }
+
+    // Redirect stdout to console
+    FILE* dummy;
+    freopen_s(&dummy, "CONOUT$", "w", stdout);
+    freopen_s(&dummy, "CONOUT$", "w", stderr);
+    freopen_s(&dummy, "CONIN$", "r", stdin);
+#endif
+}
+
 int main(int argc, char *argv[]) {
 #if defined(_MSC_VER) || defined(_MSC_FULL_VER) || defined(_MSC_BUILD)
 #error "Wrong compiler or platform!"
 #endif
+    attach_console_if_needed();
 
 #ifdef QT_DEBUG
     qDebug() << "Running in Debug mode";
