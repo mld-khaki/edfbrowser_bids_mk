@@ -719,6 +719,13 @@ int check_edf_compatibility(edfhdrblck_t *hdr, FILE *inputfile, char *errmsg, in
     }
 
     for (i = 0; i < datarecords; ++i) {
+
+        if (int(i*10000.0f/datarecords) == 0 || i == datarecords - 1) {
+            float pct = (float)(i + 1) / datarecords * 100.0f;
+            printf("\rChecking datarecord %d/%d (%.1f%%)...", i + 1, datarecords, pct);
+            fflush(stdout);
+        }
+
         if (fread(buf, recordsize, 1, inputfile) != 1) {
             snprintf(errmsg, errmsg_len, "Read error at datarecord %d.", i);
             free(buf);

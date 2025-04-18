@@ -52,6 +52,12 @@ int main(int argc, char *argv[]) {
 #error "Wrong compiler or platform!"
 #endif
 
+#ifdef QT_DEBUG
+    qDebug() << "Running in Debug mode";
+#else
+    qDebug() << "Running in Release mode";
+#endif
+
 #if CHAR_BIT != 8
 #error "unsupported char size"
 #endif
@@ -70,6 +76,7 @@ int main(int argc, char *argv[]) {
         (sizeof(long long) != 8) || (sizeof(float) != 4) ||
         (sizeof(double) != 8)) {
         fprintf(stderr, "Wrong compiler or platform!\n");
+        qCritical() << "Wrong compiler or platform!\n";
         return EXIT_FAILURE;
     }
 
@@ -80,17 +87,20 @@ int main(int argc, char *argv[]) {
         (byte_order_test_var.four[2] != 2) ||
         (byte_order_test_var.four[3] != 3)) {
         fprintf(stderr, "Wrong compiler or platform!\n");
+        qCritical() << "Wrong compiler or platform!\n";
         return EXIT_FAILURE;
     }
 
 #if defined(__LP64__)
     if (sizeof(long) != 8) {
         fprintf(stderr, "Wrong compiler or platform!\n");
+        qCritical () << "Wrong compiler or platform!\n";
         return EXIT_FAILURE;
     }
 #else
     if (sizeof(long) != 4) {
         fprintf(stderr, "Wrong compiler or platform!\n");
+        qCritical () << "Wrong compiler or platform!\n";
         return EXIT_FAILURE;
     }
 #endif
@@ -98,6 +108,7 @@ int main(int argc, char *argv[]) {
 #if defined(__MINGW64__)
     if (sizeof(long) != 4) {
         fprintf(stderr, "Wrong compiler or platform!\n");
+        qCritical () << "Wrong compiler or platform!\n";
         return EXIT_FAILURE;
     }
 #endif
@@ -112,23 +123,61 @@ int main(int argc, char *argv[]) {
 #endif
     QApplication app(argc, argv);
 
+    //========
+    // Process command line arguments to open EDF file
+    QStringList args = QCoreApplication::arguments();
     QPixmap pixmap(":/images/splash.png");
+    QSplashScreen splash(pixmap, Qt::WindowStaysOnTopHint);
 
-    QPainter p(&pixmap);
-    QFont sansFont("Noto Sans", 10);
-    p.setFont(sansFont);
-    p.setPen(Qt::black);
-    if (!strcmp(PROGRAM_BETA_SUFFIX, "")) {
-        p.drawText(250, 260, 300, 30, Qt::AlignLeft | Qt::TextSingleLine,
-                   "version " PROGRAM_VERSION "    " THIS_APP_BITS_W);
-    } else {
-        p.drawText(50, 240, 300, 30, Qt::AlignLeft | Qt::TextSingleLine,
-                   "version " PROGRAM_VERSION "  " THIS_APP_BITS_W);
-        p.drawText(50, 260, 300, 30, Qt::AlignLeft | Qt::TextSingleLine,
-                   PROGRAM_BETA_SUFFIX);
+    if (!(args.contains("--check-compatibility"))) {
+
+
+        QPainter p(&pixmap);
+        QFont sansFont("Noto Sans", 10);
+        p.setFont(sansFont);
+        p.setPen(Qt::black);
+        if (!strcmp(PROGRAM_BETA_SUFFIX, "")) {
+            p.drawText(250, 260, 300, 30, Qt::AlignLeft | Qt::TextSingleLine,
+                       "version " PROGRAM_VERSION "    " THIS_APP_BITS_W);
+        } else {
+            p.drawText(50, 240, 300, 30, Qt::AlignLeft | Qt::TextSingleLine,
+                       "version " PROGRAM_VERSION "  " THIS_APP_BITS_W);
+            p.drawText(50, 260, 300, 30, Qt::AlignLeft | Qt::TextSingleLine,
+                       PROGRAM_BETA_SUFFIX);
+        }
+
+
+
+        if (args.size() < 2) {
+            splash.show();
+            QTimer t1;
+            t1.setSingleShot(true);
+#if QT_VERSION >= 0x050000
+            t1.setTimerType(Qt::PreciseTimer);
+#endif
+            QObject::connect(&t1, SIGNAL(timeout()), &splash, SLOT(close()));
+            t1.start(3000);
+            QEventLoop evlp;
+            QTimer::singleShot(100, &evlp, SLOT(quit()));
+            evlp.exec();
+        }
+
+        qApp->setStyleSheet("QMessageBox { messagebox-text-interaction-flags: 5; }");
+
+        UI_Mainwindow *MainWindow = new UI_Mainwindow;
+        if (MainWindow == NULL) {
+            splash.close();
+            // ... error handling as before
+        }
+
+        // Attach MainWindow logic here
+
+        int ret = app.exec();
+        delete MainWindow;
+        return ret;
     }
 
-    QSplashScreen splash(pixmap, Qt::WindowStaysOnTopHint);
+    //========
 
     QTimer t1;
     t1.setSingleShot(true);
@@ -164,13 +213,12 @@ int main(int argc, char *argv[]) {
         msgBox.setIcon(QMessageBox::Critical);
         msgBox.setText(str1_512);
         msgBox.exec();
-
+        qCritical() << "Malloc error.\nFile: " <<  __FILE__ << "line: " << __LINE__;
         return EXIT_FAILURE;
     }
 
-    // Process command line arguments to open EDF file
-    QStringList args = QCoreApplication::arguments();
     if (args.size() > 1) {
+        qDebug() << "argument mode";
         if (strcmpi(argv[1], "--check-compatibility") == 0)
         {
             qWarning() << "Found the argument";
@@ -211,6 +259,7 @@ int main(int argc, char *argv[]) {
                 fclose(inputfile);
                 free(edfhdr->edfparam);
                 free(edfhdr);
+                fprintf(stdout, "Compatibility check failed: File is a NOT a valid EDF or BDF file.\n");
                 return EXIT_FAILURE;
             }
 

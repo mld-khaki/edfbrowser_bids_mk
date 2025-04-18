@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE QtCreatorProject>
-<!-- Written by QtCreator 15.0.1, 2025-04-11T13:07:31. -->
+<!-- Written by QtCreator 15.0.1, 2025-04-18T14:21:11. -->
 <qtcreator>
  <data>
   <variable>EnvironmentId</variable>
@@ -100,8 +100,8 @@
    <value type="qlonglong" key="ProjectExplorer.Target.ActiveRunConfiguration">1</value>
    <valuemap type="QVariantMap" key="ProjectExplorer.Target.BuildConfiguration.0">
     <value type="int" key="EnableQmlDebugging">0</value>
-    <value type="QString" key="ProjectExplorer.BuildConfiguration.BuildDirectory">C:\_Code\S07_EDF_Clipper\EDFB\edfbrowser_212_source\build\Desktop_Qt_6_8_2_MinGW_64_bit-Debug</value>
-    <value type="QString" key="ProjectExplorer.BuildConfiguration.BuildDirectory.shadowDir">C:/_Code/S07_EDF_Clipper/EDFB/edfbrowser_212_source/build/Desktop_Qt_6_8_2_MinGW_64_bit-Debug</value>
+    <value type="QString" key="ProjectExplorer.BuildConfiguration.BuildDirectory">C:\_Code\S22_GitHub\edfbrowser_bids_mk\edfbrowser_bids\build\Desktop_Qt_6_8_2_MinGW_64_bit-Debug2</value>
+    <value type="QString" key="ProjectExplorer.BuildConfiguration.BuildDirectory.shadowDir">C:/_Code/S22_GitHub/edfbrowser_bids_mk/edfbrowser_bids/build/Desktop_Qt_6_8_2_MinGW_64_bit-Debug2</value>
     <valuemap type="QVariantMap" key="ProjectExplorer.BuildConfiguration.BuildStepList.0">
      <valuemap type="QVariantMap" key="ProjectExplorer.BuildStepList.Step.0">
       <value type="bool" key="ProjectExplorer.BuildStep.Enabled">true</value>
@@ -112,7 +112,7 @@
      <valuemap type="QVariantMap" key="ProjectExplorer.BuildStepList.Step.1">
       <value type="bool" key="ProjectExplorer.BuildStep.Enabled">true</value>
       <value type="QString" key="ProjectExplorer.ProjectConfiguration.Id">Qt4ProjectManager.MakeStep</value>
-      <value type="qlonglong" key="Qt4ProjectManager.MakeStep.JobCount">10</value>
+      <value type="qlonglong" key="Qt4ProjectManager.MakeStep.JobCount">6</value>
      </valuemap>
      <value type="qlonglong" key="ProjectExplorer.BuildStepList.StepsCount">2</value>
      <value type="QString" key="ProjectExplorer.ProjectConfiguration.DefaultDisplayName">Build</value>
@@ -267,13 +267,13 @@
     <value type="QString" key="ProjectExplorer.ProjectConfiguration.Id">Qt4ProjectManager.Qt4RunConfiguration:</value>
     <value type="QString" key="ProjectExplorer.RunConfiguration.BuildKey">C:/_Code/S22_GitHub/edfbrowser_bids_mk/edfbrowser_bids/edfbrowser.pro</value>
     <value type="bool" key="ProjectExplorer.RunConfiguration.Customized">true</value>
-    <value type="QString" key="RunConfiguration.Arguments">--check-compatibility &quot;v:\xDone_Step_B_EDF_with_id\sub-030_PachecoRobert\sub-030\Pacheco~ Rober_0a13940c-9c6b-4365-883d-913fbec31a3c.EDF&quot;</value>
+    <value type="QString" key="RunConfiguration.Arguments">--check-compatibility &quot;c:\_code_temp\PR_cec2bc1b-7803-4e05-babd-8734e321a62a.EDF&quot;</value>
     <value type="bool" key="RunConfiguration.Arguments.multi">true</value>
     <value type="bool" key="RunConfiguration.UseCppDebuggerAuto">true</value>
     <value type="bool" key="RunConfiguration.UseLibrarySearchPath">true</value>
     <value type="bool" key="RunConfiguration.UseQmlDebuggerAuto">true</value>
     <value type="bool" key="RunConfiguration.UseTerminal">true</value>
-    <value type="QString" key="RunConfiguration.WorkingDirectory.default">C:/_Code/S07_EDF_Clipper/EDFB/edfbrowser_212_source/build/Desktop_Qt_6_8_2_MinGW_64_bit-Debug</value>
+    <value type="QString" key="RunConfiguration.WorkingDirectory.default">C:/_Code/S22_GitHub/edfbrowser_bids_mk/edfbrowser_bids/build/Desktop_Qt_6_8_2_MinGW_64_bit-Debug2</value>
    </valuemap>
    <value type="qlonglong" key="ProjectExplorer.Target.RunConfigurationCount">2</value>
   </valuemap>
