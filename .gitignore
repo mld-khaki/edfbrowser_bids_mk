@@ -2,3 +2,8 @@
 *.log
 *.csv
 *.edf
+*.bak2
+*.bak
+/edfbrowser_bids_mk_windows/build
+/edfbrowser_bids_mk_linux/edfbrowser_214_source/build
+/edfbrowser_bids_mk_linux/build
