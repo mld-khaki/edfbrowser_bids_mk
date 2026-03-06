@@ -6,4 +6,6 @@
 *.bak
 /edfbrowser_bids_mk_windows/build
 /edfbrowser_bids_mk_linux/edfbrowser_214_source/build
+/edfbrowser_bids_mk_linux/.qtcreator/
+/edfbrowser_bids_mk_windows/build/
 /edfbrowser_bids_mk_linux/build
