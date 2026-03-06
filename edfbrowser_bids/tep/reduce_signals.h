@@ -130,7 +130,6 @@ void LoadFromJson();
 
 
 
-
 /* =========================
    Command-line (headless) reduction
    ========================= */

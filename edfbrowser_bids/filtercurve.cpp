@@ -29,6 +29,7 @@
 #include "filtercurve.h"
 
 
+
 FilterCurve::FilterCurve(QWidget *w_parent) : QWidget(w_parent)
 {
   setAttribute(Qt::WA_OpaquePaintEvent);

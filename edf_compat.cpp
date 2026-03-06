@@ -28,7 +28,40 @@
 
 #include "edf_compat.h"
 #include "mainwindow.h"
+#include <string>
+#include <cstdarg>
+#include <vector>
+#include <algorithm>
 
+// Append printf-formatted text to a std::string (portable)
+static void appendf(std::string &out, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+
+    // First pass: compute required size
+    va_list args_copy;
+    va_copy(args_copy, args);
+    int needed = vsnprintf(nullptr, 0, fmt, args_copy);
+    va_end(args_copy);
+
+    if (needed > 0) {
+        std::vector<char> buf(static_cast<size_t>(needed) + 1);
+        vsnprintf(buf.data(), buf.size(), fmt, args);
+        out.append(buf.data());
+    }
+
+    va_end(args);
+}
+
+// Copy std::string into errmsg safely (null-terminated)
+static void copy_to_errmsg(const std::string &src, char *errmsg, int errmsg_len)
+{
+    if (!errmsg || errmsg_len <= 0) return;
+    size_t n = std::min(src.size(), static_cast<size_t>(errmsg_len - 1));
+    memcpy(errmsg, src.data(), n);
+    errmsg[n] = '\0';
+}
 
 
 UI_EDFCompatwindow::UI_EDFCompatwindow(QWidget *w_parent)
@@ -765,7 +798,7 @@ int check_edf_compatibility(edfhdrblck_t *hdr, FILE *inputfile, char *errmsg, in
     snprintf(str_tmp, sizeof(str_tmp), "File type: %s%s\n",
              hdr->edf ? "EDF" : "BDF",
              hdr->edfplus || hdr->bdfplus ? "+" : "");
-    strcat_s(summary, str_tmp);
+    strcat(summary, str_tmp);
 
     snprintf(str_tmp, sizeof(str_tmp), "Number of signals: %i\n", hdr->edfsignals);
     strcat_s(summary, str_tmp);

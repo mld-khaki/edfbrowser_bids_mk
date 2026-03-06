@@ -1,0 +1,2 @@
+edfbrowser.exe --reduce-signal --from "2024-06-26 13:07:52" --to   "2024-06-26 13:15:13" --mask-signals "c###" --input   "c:\_Code\S22_GitHub\edfbrowser_bids_mk\testcase\sub-P151_ses-001_task-ccep_run-01_ieeg.edf" --output  "c:\_Code\S22_GitHub\edfbrowser_bids_mk\testcase\sub-P151_ses-001_task-ccep_run-01_ieeg_clipped.edf" 
+  --overwrite

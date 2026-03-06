@@ -50,14 +50,15 @@
 
 
 #include "mainwindow.h"
+#include "reduce_signals.h"
 #include "edf_compat.h"
 
 #ifdef _WIN32
 #include <windows.h>
-#endif
 
+// Global file pointer for output
+FILE* g_output_file = NULL;
 void attach_console_if_needed() {
-#ifdef _WIN32
     // If no console exists, create one
     if (AttachConsole(ATTACH_PARENT_PROCESS) == 0) {
         AllocConsole();
@@ -68,12 +69,14 @@ void attach_console_if_needed() {
     freopen_s(&dummy, "CONOUT$", "w", stdout);
     freopen_s(&dummy, "CONOUT$", "w", stderr);
     freopen_s(&dummy, "CONIN$", "r", stdin);
-#endif
 }
+#else
+// Empty implementation for non-Windows platforms
+void attach_console_if_needed() {}
+#endif
 
-// Function to save compatibility check results to a file
-void save_check_result(const char* edf_file_path, bool passed, const char* output_content, double elapsed_time) {
-    // Extract base name and directory
+// Function to initialize the output file
+bool init_output_file(const char* edf_file_path) {    // Extract base name and directory
     QFileInfo file_info(edf_file_path);
     QString base_name = file_info.completeBaseName();
     QString dir_path = file_info.absolutePath();
@@ -165,12 +168,262 @@ void file_printf(const char* format, ...) {
     va_end(args2);
 }
 
+char buf[512];
+
+static void print_reduce_signals_usage()
+{
+    fprintf(stderr,
+        "Usage:\n"
+        "  edfbrowser --reduce-signal  --input <input.edf|input.bdf> --output <output.edf|output.bdf> [options]\n"
+        "  edfbrowser --reduce-signals --in    <input.edf|input.bdf> --out    <output.edf|output.bdf> [options]\n"
+        "\n"
+        "Time clipping (preferred):\n"
+        "  --from \"YYYY-MM-DD HH:MM:SS\"   Start timestamp (or HH:MM:SS)\n"
+        "  --to   \"YYYY-MM-DD HH:MM:SS\"   End timestamp   (or HH:MM:SS)\n"
+        "  --pre-offset-min <N>              Minutes before --from (default 0)\n"
+        "  --post-offset-min <N>             Minutes after  --to   (default 0)\n"
+        "\n"
+        "Signal selection:\n"
+        "  --mask-signals <pattern[,pattern]>  Wildcards: * ? # (digit). Example: c###\n"
+        "  --signals <csv>                    Examples: all | Fp1,Fp2,ECG | Fp1:2,Fp2:4,#12:8\n"
+        "  --sr-divider <N>                   Default samplerate divider for selected signals\n"
+        "\n"
+        "Record-range clipping (alternative):\n"
+        "  --from-record <N>                  1-based inclusive start datarecord\n"
+        "  --to-record   <N>                  1-based inclusive end datarecord\n"
+        "\n"
+        "Other:\n"
+        "  --aa-order <N>                     Anti-aliasing filter order (0..4). Default 3\n"
+        "  --json <path.json>                 JSON config (overrides/augments --signals)\n"
+        "  --no-annotations                   Do not read/carry EDF+/BDF+ annotations\n"
+        "  --overwrite                        Overwrite output file if it exists\n"
+        "  -h, --help                         Show this help\n"
+        "\n"
+        "Examples:\n"
+        "  edfbrowser --reduce-signal --input in.edf --output out.edf --from \"2024-02-11 12:13:52\" --to \"2024-02-11 12:14:10\" --mask-signals \"c###\" --overwrite\n"
+        "  edfbrowser --reduce-signals --in in.edf --out out.edf --signals all --sr-divider 2\n"
+    );
+}
+
+static int run_reduce_signals_cli(int argc, char *argv[])
+{
+    reduce_signals_cli_options_t opt;
+    memset(&opt, 0, sizeof(opt));
+
+    /* Defaults to match the GUI dialog as closely as possible */
+    opt.from_datarecord = 1;
+    opt.to_datarecord = 0;              /* 0 means end-of-file */
+    opt.aa_filter_order = 3;            /* GUI default: spinBox4=4 -> order=3 */
+    opt.read_annotations = 1;
+    opt.overwrite_existing = 0;
+    opt.global_samplerate_divider = 1;
+    opt.signals_csv[0] = 0;
+    opt.json_config_path[0] = 0;
+    opt.from_timestamp[0] = 0;
+    opt.to_timestamp[0] = 0;
+    opt.pre_offset_minutes = 0;
+    opt.post_offset_minutes = 0;
+    opt.mask_signals[0] = 0;
+
+    const char *in_path = NULL;
+    const char *out_path = NULL;
+
+    for(int i=2; i<argc; i++)
+    {
+        const char *a = argv[i];
+
+        if((!strcmpi(a, "-h")) || (!strcmpi(a, "--help")))
+        {
+            print_reduce_signals_usage();
+            return EXIT_SUCCESS;
+        }
+        else if((!strcmpi(a, "--in")) || (!strcmpi(a, "--input")) || (!strcmpi(a, "-i")))
+        {
+            if(i + 1 >= argc)
+            {
+                fprintf(stderr, "Error: --in requires a value.\n");
+                print_reduce_signals_usage();
+                return EXIT_FAILURE;
+            }
+            in_path = argv[++i];
+        }
+        else if((!strcmpi(a, "--out")) || (!strcmpi(a, "--output")) || (!strcmpi(a, "-o")))
+        {
+            if(i + 1 >= argc)
+            {
+                fprintf(stderr, "Error: --out requires a value.\n");
+                print_reduce_signals_usage();
+                return EXIT_FAILURE;
+            }
+            out_path = argv[++i];
+        }
+        else if(!strcmpi(a, "--signals"))
+        {
+            if(i + 1 >= argc)
+            {
+                fprintf(stderr, "Error: --signals requires a value.\n");
+                print_reduce_signals_usage();
+                return EXIT_FAILURE;
+            }
+            strncpy(opt.signals_csv, argv[++i], sizeof(opt.signals_csv) - 1);
+            opt.signals_csv[sizeof(opt.signals_csv) - 1] = 0;
+        }
+        else if((!strcmpi(a, "--sr-divider")) || (!strcmpi(a, "--srdiv")))
+        {
+            if(i + 1 >= argc)
+            {
+                fprintf(stderr, "Error: --sr-divider requires a value.\n");
+                print_reduce_signals_usage();
+                return EXIT_FAILURE;
+            }
+            opt.global_samplerate_divider = atoi(argv[++i]);
+        }
+        else if(!strcmpi(a, "--from-record"))
+        {
+            if(i + 1 >= argc)
+            {
+                fprintf(stderr, "Error: --from-record requires a value.\n");
+                print_reduce_signals_usage();
+                return EXIT_FAILURE;
+            }
+            opt.from_datarecord = atoi(argv[++i]);
+        }
+        else if(!strcmpi(a, "--to-record"))
+        {
+            if(i + 1 >= argc)
+            {
+                fprintf(stderr, "Error: --to-record requires a value.\n");
+                print_reduce_signals_usage();
+                return EXIT_FAILURE;
+            }
+            opt.to_datarecord = atoi(argv[++i]);
+        }
+        else if(!strcmpi(a, "--from"))
+        {
+            if(i + 1 >= argc)
+            {
+                fprintf(stderr, "Error: --from requires a value.\n");
+                print_reduce_signals_usage();
+                return EXIT_FAILURE;
+            }
+            strncpy(opt.from_timestamp, argv[++i], sizeof(opt.from_timestamp) - 1);
+            opt.from_timestamp[sizeof(opt.from_timestamp) - 1] = 0;
+        }
+        else if(!strcmpi(a, "--to"))
+        {
+            if(i + 1 >= argc)
+            {
+                fprintf(stderr, "Error: --to requires a value.\n");
+                print_reduce_signals_usage();
+                return EXIT_FAILURE;
+            }
+            strncpy(opt.to_timestamp, argv[++i], sizeof(opt.to_timestamp) - 1);
+            opt.to_timestamp[sizeof(opt.to_timestamp) - 1] = 0;
+        }
+        else if(!strcmpi(a, "--pre-offset-min") || !strcmpi(a, "--pre-offset"))
+        {
+            if(i + 1 >= argc)
+            {
+                fprintf(stderr, "Error: --pre-offset-min requires a value.\n");
+                print_reduce_signals_usage();
+                return EXIT_FAILURE;
+            }
+            opt.pre_offset_minutes = atoi(argv[++i]);
+            if(opt.pre_offset_minutes < 0) opt.pre_offset_minutes = 0;
+        }
+        else if(!strcmpi(a, "--post-offset-min") || !strcmpi(a, "--post-offset"))
+        {
+            if(i + 1 >= argc)
+            {
+                fprintf(stderr, "Error: --post-offset-min requires a value.\n");
+                print_reduce_signals_usage();
+                return EXIT_FAILURE;
+            }
+            opt.post_offset_minutes = atoi(argv[++i]);
+            if(opt.post_offset_minutes < 0) opt.post_offset_minutes = 0;
+        }
+        else if(!strcmpi(a, "--mask-signals") || !strcmpi(a, "--mask"))
+        {
+            if(i + 1 >= argc)
+            {
+                fprintf(stderr, "Error: --mask-signals requires a value.\n");
+                print_reduce_signals_usage();
+                return EXIT_FAILURE;
+            }
+            strncpy(opt.mask_signals, argv[++i], sizeof(opt.mask_signals) - 1);
+            opt.mask_signals[sizeof(opt.mask_signals) - 1] = 0;
+        }
+        else if(!strcmpi(a, "--aa-order"))
+        {
+            if(i + 1 >= argc)
+            {
+                fprintf(stderr, "Error: --aa-order requires a value.\n");
+                print_reduce_signals_usage();
+                return EXIT_FAILURE;
+            }
+            opt.aa_filter_order = atoi(argv[++i]);
+        }
+        else if(!strcmpi(a, "--json"))
+        {
+            if(i + 1 >= argc)
+            {
+                fprintf(stderr, "Error: --json requires a value.\n");
+                print_reduce_signals_usage();
+                return EXIT_FAILURE;
+            }
+            strncpy(opt.json_config_path, argv[++i], sizeof(opt.json_config_path) - 1);
+            opt.json_config_path[sizeof(opt.json_config_path) - 1] = 0;
+        }
+        else if(!strcmpi(a, "--no-annotations"))
+        {
+            opt.read_annotations = 0;
+        }
+        else if(!strcmpi(a, "--overwrite"))
+        {
+            opt.overwrite_existing = 1;
+        }
+        else
+        {
+            fprintf(stderr, "Error: Unknown option: %s\n", a);
+            print_reduce_signals_usage();
+            return EXIT_FAILURE;
+        }
+    }
+
+    if((in_path == NULL) || (in_path[0] == 0))
+    {
+        fprintf(stderr, "Error: missing --in <inputfile>.\n");
+        print_reduce_signals_usage();
+        return EXIT_FAILURE;
+    }
+
+    char err[4096] = {0};
+
+    const int rc = reduce_signals_cli(in_path, out_path, &opt, err, sizeof(err));
+
+    if(rc != 0)
+    {
+        if(err[0] != 0)
+        {
+            fprintf(stderr, "reduce-signals failed: %s\n", err);
+        }
+        else
+        {
+            fprintf(stderr, "reduce-signals failed.\n");
+        }
+        return EXIT_FAILURE;
+    }
+
+    return EXIT_SUCCESS;
+}
+
 // Updated main function with direct file output changes
 int main(int argc, char *argv[]) {
 #if defined(_MSC_VER) || defined(_MSC_FULL_VER) || defined(_MSC_BUILD)
 #error "Wrong compiler or platform!"
 #endif
-    attach_console_if_needed();
+
+    attach_console_if_needed();  // Add this back
 
 #ifdef QT_DEBUG
     qDebug() << "Running in Debug mode";
@@ -247,6 +500,10 @@ int main(int argc, char *argv[]) {
 
     if (args.size() > 1) {
         qDebug() << "argument mode";
+        if ((strcmpi(argv[1], "--reduce-signals") == 0) || (strcmpi(argv[1], "--reduce-signal") == 0))
+        {
+            return run_reduce_signals_cli(argc, argv);
+        }
         if (strcmpi(argv[1], "--check-compatibility") == 0)
         {
             qWarning() << "Found the argument";
@@ -321,9 +578,17 @@ int main(int argc, char *argv[]) {
                 
                 return EXIT_FAILURE;
             }
+            else
+            {
+                strcpy(buf,"EDF Header loaded correctly\r\n");
+                file_printf(buf);
+                qCritical() << buf;
+            }
 
-            char compat_err[2048] = {0};
+            char compat_err[4096] = {0};
             int result = check_edf_compatibility(edfhdr, inputfile, compat_err, sizeof(compat_err));
+
+            file_printf(compat_err);
 
             // Determine if compatibility check passed
             bool check_passed = (result == 0);
@@ -335,7 +600,11 @@ int main(int argc, char *argv[]) {
 
                 file_printf("Number of signals: %i\n", edfhdr->edfsignals);
 
+                file_printf("Data record duration: %f\n", edfhdr->data_record_duration);
+                file_printf("Recording length in Sec: %lli\n", edfhdr->recording_duration_hr);
                 file_printf("Number of data records: %lli\n", edfhdr->datarecords);
+
+                file_printf("Discontinuous state of file: <%d>\n", edfhdr->discontinuous);
 
                 file_printf("Recording duration: %d seconds\n", edfhdr->recording_len_sec);
             } else {
@@ -397,14 +666,13 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Error: File %s does not exist.\n",
                         filePath.toLocal8Bit().constData());
             }
-        }
-    }
+    } // <-- This is the correct closing brace for the if (args.size() > 1) statement
 
     QPixmap pixmap(":/images/splash.png");
     QSplashScreen splash(pixmap, Qt::WindowStaysOnTopHint);
 
-    if (!(args.contains("--check-compatibility"))) {
-
+    if (!(args.contains("--check-compatibility")))
+    {
 
         QPainter p(&pixmap);
         QFont sansFont("Noto Sans", 10);
@@ -438,10 +706,22 @@ int main(int argc, char *argv[]) {
 
         qApp->setStyleSheet("QMessageBox { messagebox-text-interaction-flags: 5; }");
 
+        char str1_512[512]="";
+
         UI_Mainwindow *MainWindow = new UI_Mainwindow;
         if (MainWindow == NULL) {
             splash.close();
-            // ... error handling as before
+
+            snprintf(str1_512, 512, "Malloc error.\nFile: %s  line: %i", __FILE__, __LINE__);
+
+            fprintf(stderr, "%s\n", str1_512);
+
+            QMessageBox msgBox;
+            msgBox.setIcon(QMessageBox::Critical);
+            msgBox.setText(str1_512);
+            msgBox.exec();
+
+            return EXIT_FAILURE;
         }
 
         // Attach MainWindow logic here
@@ -497,7 +777,7 @@ int main(int argc, char *argv[]) {
     delete MainWindow;
 
     qDebug() << "Checked successfully!";
-    return EXIT_SUCCESS;
+    return ret;
 }
 
 void UI_Mainwindow::showEvent(QShowEvent *event) {

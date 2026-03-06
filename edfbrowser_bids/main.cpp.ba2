@@ -54,10 +54,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#endif
 
+// Global file pointer for output
+FILE* g_output_file = NULL;
 void attach_console_if_needed() {
-#ifdef _WIN32
     // If no console exists, create one
     if (AttachConsole(ATTACH_PARENT_PROCESS) == 0) {
         AllocConsole();
@@ -68,12 +68,14 @@ void attach_console_if_needed() {
     freopen_s(&dummy, "CONOUT$", "w", stdout);
     freopen_s(&dummy, "CONOUT$", "w", stderr);
     freopen_s(&dummy, "CONIN$", "r", stdin);
-#endif
 }
+#else
+// Empty implementation for non-Windows platforms
+void attach_console_if_needed() {}
+#endif
 
-// Function to save compatibility check results to a file
-void save_check_result(const char* edf_file_path, bool passed, const char* output_content, double elapsed_time) {
-    // Extract base name and directory
+// Function to initialize the output file
+bool init_output_file(const char* edf_file_path) {    // Extract base name and directory
     QFileInfo file_info(edf_file_path);
     QString base_name = file_info.completeBaseName();
     QString dir_path = file_info.absolutePath();
@@ -165,12 +167,15 @@ void file_printf(const char* format, ...) {
     va_end(args2);
 }
 
+char buf[512];
+
 // Updated main function with direct file output changes
 int main(int argc, char *argv[]) {
 #if defined(_MSC_VER) || defined(_MSC_FULL_VER) || defined(_MSC_BUILD)
 #error "Wrong compiler or platform!"
 #endif
-    attach_console_if_needed();
+
+    attach_console_if_needed();  // Add this back
 
 #ifdef QT_DEBUG
     qDebug() << "Running in Debug mode";
@@ -321,9 +326,17 @@ int main(int argc, char *argv[]) {
                 
                 return EXIT_FAILURE;
             }
+            else
+            {
+                strcpy(buf,"EDF Header loaded correctly\r\n");
+                file_printf(buf);
+                qCritical() << buf;
+            }
 
-            char compat_err[2048] = {0};
+            char compat_err[4096] = {0};
             int result = check_edf_compatibility(edfhdr, inputfile, compat_err, sizeof(compat_err));
+
+            file_printf(compat_err);
 
             // Determine if compatibility check passed
             bool check_passed = (result == 0);
@@ -335,7 +348,11 @@ int main(int argc, char *argv[]) {
 
                 file_printf("Number of signals: %i\n", edfhdr->edfsignals);
 
+                file_printf("Data record duration: %f\n", edfhdr->data_record_duration);
+                file_printf("Recording length in Sec: %lli\n", edfhdr->recording_duration_hr);
                 file_printf("Number of data records: %lli\n", edfhdr->datarecords);
+
+                file_printf("Discontinuous state of file: <%d>\n", edfhdr->discontinuous);
 
                 file_printf("Recording duration: %d seconds\n", edfhdr->recording_len_sec);
             } else {
@@ -397,14 +414,13 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Error: File %s does not exist.\n",
                         filePath.toLocal8Bit().constData());
             }
-        }
-    }
+    } // <-- This is the correct closing brace for the if (args.size() > 1) statement
 
     QPixmap pixmap(":/images/splash.png");
     QSplashScreen splash(pixmap, Qt::WindowStaysOnTopHint);
 
-    if (!(args.contains("--check-compatibility"))) {
-
+    if (!(args.contains("--check-compatibility")))
+    {
 
         QPainter p(&pixmap);
         QFont sansFont("Noto Sans", 10);
@@ -438,10 +454,22 @@ int main(int argc, char *argv[]) {
 
         qApp->setStyleSheet("QMessageBox { messagebox-text-interaction-flags: 5; }");
 
+        char str1_512[512]="";
+
         UI_Mainwindow *MainWindow = new UI_Mainwindow;
         if (MainWindow == NULL) {
             splash.close();
-            // ... error handling as before
+
+            snprintf(str1_512, 512, "Malloc error.\nFile: %s  line: %i", __FILE__, __LINE__);
+
+            fprintf(stderr, "%s\n", str1_512);
+
+            QMessageBox msgBox;
+            msgBox.setIcon(QMessageBox::Critical);
+            msgBox.setText(str1_512);
+            msgBox.exec();
+
+            return EXIT_FAILURE;
         }
 
         // Attach MainWindow logic here
@@ -497,7 +525,7 @@ int main(int argc, char *argv[]) {
     delete MainWindow;
 
     qDebug() << "Checked successfully!";
-    return EXIT_SUCCESS;
+    return ret;
 }
 
 void UI_Mainwindow::showEvent(QShowEvent *event) {

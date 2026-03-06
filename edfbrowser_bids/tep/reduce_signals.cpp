@@ -28,6 +28,9 @@
 
 #include "reduce_signals.h"
 
+#include <cmath>
+#include <QRegularExpression>
+
 
 
 UI_ReduceSignalsWindow::UI_ReduceSignalsWindow(QWidget *w_parent)
@@ -1573,26 +1576,15 @@ void UI_ReduceSignalsWindow::LoadFromJson()
 }
 
 
+
 /* =========================
    Command-line (headless) reduction
    ========================= */
 
 #include <stdarg.h>
-#include <math.h>
-
-#include <QMap>
-#include <QMapIterator>
-#include <QStringList>
-#include <QByteArray>
-#include <QIODevice>
-
 #include <QFileInfo>
-#include <QFile>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonArray>
-#include <QDateTime>
-
+#include <QDir>
+#include <QTextStream>
 #include "edf_annotations.h"
 
 static void rs_set_err(char *err_out, int err_out_sz, const char *fmt, ...)
@@ -1631,11 +1623,6 @@ static int rs_find_signal_index(edfhdrblck_t *edfhdr, const QString &needle)
   return -1;
 }
 
-/* Wildcard matching:
-     * matches any sequence
-     ? matches one char
-     # matches one digit
-*/
 static bool rs_match_pattern_impl(const QString &s, int si, const QString &p, int pi)
 {
   const int slen = s.size();
@@ -1655,6 +1642,7 @@ static bool rs_match_pattern_impl(const QString &s, int si, const QString &p, in
 
     if(pc == QChar('*'))
     {
+      /* Collapse consecutive '*' */
       while((pidx + 1 < plen) && (p.at(pidx + 1) == QChar('*')))
       {
         pidx++;
@@ -1662,9 +1650,10 @@ static bool rs_match_pattern_impl(const QString &s, int si, const QString &p, in
 
       if(pidx + 1 >= plen)
       {
-        return true;
+        return true;  /* trailing '*' matches everything */
       }
 
+      /* Try all suffixes */
       for(int k = sidx; k <= slen; k++)
       {
         if(rs_match_pattern_impl(s, k, p, pidx + 1))
@@ -1742,6 +1731,294 @@ static bool rs_match_any_mask(const QString &label, const QString &mask_csv)
   return false;
 }
 
+static bool rs_parse_datetime_flexible(const QString &input,
+                                       const QDate &fallback_date,
+                                       QDateTime &out_dt,
+                                       QString &err)
+{
+  err.clear();
+
+  QString s = input.trimmed();
+  if(s.isEmpty())
+  {
+    err = "Empty datetime string.";
+    return false;
+  }
+
+  /* Normalize a few common separators */
+  s.replace('T', ' ');
+
+  /* Try a few common strict formats first */
+  const QStringList fmts = {
+    "yyyy-MM-dd HH:mm:ss",
+    "yyyy-MM-dd HH:mm:ss.zzz",
+    "yyyy/MM/dd HH:mm:ss",
+    "yyyy/MM/dd HH:mm:ss.zzz",
+    "yyyy-MM-dd HH-mm-ss",
+    "yyyy/MM/dd HH-mm-ss",
+    "HH:mm:ss",
+    "HH:mm:ss.zzz",
+    "HH-mm-ss"
+  };
+
+  for(const QString &fmt : fmts)
+  {
+    QDateTime dt = QDateTime::fromString(s, fmt);
+    if(dt.isValid())
+    {
+      /* If no date was provided, Qt uses 1900-01-01. Replace it with fallback. */
+      if((fmt.startsWith("HH")) && fallback_date.isValid())
+      {
+        dt.setDate(fallback_date);
+      }
+      dt.setTimeSpec(Qt::UTC);
+      out_dt = dt;
+      return true;
+    }
+  }
+
+  /* Manual parse: optional leading date + time with messy separators */
+  QDate date = fallback_date;
+  QString time_part = s;
+
+  QRegularExpression reDate(R"(^\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(.+)\s*$)");
+  QRegularExpressionMatch md = reDate.match(s);
+  if(md.hasMatch())
+  {
+    bool okY=false, okM=false, okD=false;
+    int yy = md.captured(1).toInt(&okY);
+    int mm = md.captured(2).toInt(&okM);
+    int dd = md.captured(3).toInt(&okD);
+    if(okY && okM && okD)
+    {
+      QDate d(yy, mm, dd);
+      if(d.isValid())
+      {
+        date = d;
+        time_part = md.captured(4).trimmed();
+      }
+    }
+  }
+
+  if(!date.isValid())
+  {
+    err = "Could not determine date (provide YYYY-MM-DD or ensure EDF start date is valid).";
+    return false;
+  }
+
+  QRegularExpression reNum(R"((\d+))");
+  QRegularExpressionMatchIterator it = reNum.globalMatch(time_part);
+
+  QList<QString> nums;
+  while(it.hasNext())
+  {
+    QRegularExpressionMatch m2 = it.next();
+    nums.append(m2.captured(1));
+  }
+
+  if(nums.size() < 2)
+  {
+    err = "Could not parse time component (expected at least HH:MM).";
+    return false;
+  }
+
+  bool okH=false, okMin=false, okS=true;
+  int hh = nums.at(0).toInt(&okH);
+  int mi = nums.at(1).toInt(&okMin);
+  int ss = 0;
+  int ms = 0;
+
+  if(nums.size() >= 3)
+  {
+    ss = nums.at(2).toInt(&okS);
+  }
+
+  if(!(okH && okMin && okS))
+  {
+    err = "Invalid numeric time fields.";
+    return false;
+  }
+
+  if(nums.size() >= 4)
+  {
+    const QString frac = nums.at(3);
+    bool okF=false;
+    int v = frac.toInt(&okF);
+    if(okF)
+    {
+      if(frac.size() >= 3)
+      {
+        ms = v;
+      }
+      else if(frac.size() == 2)
+      {
+        ms = v * 10;
+      }
+      else if(frac.size() == 1)
+      {
+        ms = v * 100;
+      }
+      else
+      {
+        ms = 0;
+      }
+      if(ms > 999) ms = 999;
+    }
+  }
+
+  QTime t(hh, mi, ss, ms);
+  if(!t.isValid())
+  {
+    err = "Invalid time (out of range).";
+    return false;
+  }
+
+  out_dt = QDateTime(date, t, Qt::UTC);
+  return true;
+}
+
+static bool rs_compute_record_range_from_timestamps(edfhdrblck_t *edfhdr,
+                                                    const reduce_signals_cli_options_t &opt,
+                                                    int &out_from_rec,
+                                                    int &out_to_rec,
+                                                    QString &err)
+{
+  err.clear();
+
+  if(edfhdr == NULL)
+  {
+    err = "Internal error: edfhdr is NULL.";
+    return false;
+  }
+
+  if((opt.from_timestamp[0] == 0) && (opt.to_timestamp[0] == 0))
+  {
+    return false;  /* not applicable */
+  }
+
+  if(edfhdr->datarecords <= 0)
+  {
+    err = "This file has an unknown/invalid number of datarecords; cannot compute time-based clipping.";
+    return false;
+  }
+
+  const double rec_dur_sec = (double)edfhdr->long_data_record_duration / (double)TIME_FIXP_SCALING;
+  if(rec_dur_sec <= 0.0)
+  {
+    err = "Invalid data record duration in EDF header.";
+    return false;
+  }
+
+  date_time_t dts;
+  utc_to_date_time(edfhdr->utc_starttime, &dts);
+
+  QDate rec_date(dts.year, dts.month, dts.day);
+  QTime rec_time(dts.hour, dts.minute, dts.second, 0);
+
+  QDateTime rec_start_dt(rec_date, rec_time, Qt::UTC);
+
+  if(edfhdr->starttime_subsec > 0)
+  {
+    const double start_ms = ((double)edfhdr->starttime_subsec * 1000.0) / (double)TIME_FIXP_SCALING;
+    rec_start_dt = rec_start_dt.addMSecs((qint64)llround(start_ms));
+  }
+
+  const QDate fallback_date = rec_start_dt.date();
+
+  bool have_from = (opt.from_timestamp[0] != 0);
+  bool have_to = (opt.to_timestamp[0] != 0);
+
+  QDateTime user_from_dt;
+  QDateTime user_to_dt;
+
+  if(have_from)
+  {
+    QString perr;
+    if(!rs_parse_datetime_flexible(QString::fromLocal8Bit(opt.from_timestamp), fallback_date, user_from_dt, perr))
+    {
+      err = "Could not parse --from: " + perr;
+      return false;
+    }
+  }
+  else
+  {
+    user_from_dt = rec_start_dt;
+  }
+
+  if(have_to)
+  {
+    QString perr;
+    if(!rs_parse_datetime_flexible(QString::fromLocal8Bit(opt.to_timestamp), fallback_date, user_to_dt, perr))
+    {
+      err = "Could not parse --to: " + perr;
+      return false;
+    }
+  }
+  else
+  {
+    /* If only --from is provided, clip to end-of-file */
+    user_to_dt = user_from_dt;
+    user_to_dt = user_to_dt.addSecs((qint64)llround((double)edfhdr->datarecords * rec_dur_sec));
+  }
+
+  /* Apply offsets (like the Python helper) */
+  QDateTime adjusted_start = user_from_dt.addSecs(-(qint64)opt.pre_offset_minutes * 60);
+  QDateTime adjusted_end   = user_to_dt.addSecs( (qint64)opt.post_offset_minutes * 60);
+
+  /* If user provided time-only (fallback date), they might mean "next day".
+     Mimic the Python wrap: if adjusted times are before recording start, add 1 day. */
+  while(adjusted_start < rec_start_dt)
+  {
+    adjusted_start = adjusted_start.addDays(1);
+  }
+
+  while(adjusted_end < rec_start_dt)
+  {
+    adjusted_end = adjusted_end.addDays(1);
+  }
+
+  if(adjusted_end < adjusted_start)
+  {
+    adjusted_end = adjusted_end.addDays(1);
+  }
+
+  const double total_duration_sec = (double)edfhdr->datarecords * rec_dur_sec;
+  const double records_per_second = (double)edfhdr->datarecords / total_duration_sec;
+
+  const double delta_start_sec = (double)rec_start_dt.msecsTo(adjusted_start) / 1000.0;
+  const double delta_end_sec   = (double)rec_start_dt.msecsTo(adjusted_end) / 1000.0;
+
+  long long record_start0 = llround(delta_start_sec * records_per_second);
+  long long record_end0   = llround(delta_end_sec * records_per_second) - 1LL;
+
+  /* Convert to 1-based inclusive datarecord indices */
+  long long from_rec = record_start0 + 1LL;
+  long long to_rec   = record_end0 + 1LL;
+
+  if(from_rec < 1LL) from_rec = 1LL;
+  if(to_rec < 1LL)   to_rec = 1LL;
+
+  if(from_rec > (long long)edfhdr->datarecords) from_rec = (long long)edfhdr->datarecords;
+  if(to_rec   > (long long)edfhdr->datarecords) to_rec   = (long long)edfhdr->datarecords;
+
+  if(to_rec < from_rec)
+  {
+    err = QString("Invalid time window after conversion: from_rec=%1 > to_rec=%2").arg(from_rec).arg(to_rec);
+    return false;
+  }
+
+  if(from_rec > 2147483647LL || to_rec > 2147483647LL)
+  {
+    err = "This tool cannot handle more than 2147483647 datarecords.";
+    return false;
+  }
+
+  out_from_rec = (int)from_rec;
+  out_to_rec = (int)to_rec;
+
+  return true;
+}
+
 static bool rs_load_json_config(const QString &json_path,
                                 QMap<QString, int> &label_to_divider,
                                 bool &has_range,
@@ -1754,7 +2031,6 @@ static bool rs_load_json_config(const QString &json_path,
   label_to_divider.clear();
   has_range = false;
   has_aa = false;
-  err.clear();
 
   QFile f(json_path);
   if(!f.open(QIODevice::ReadOnly))
@@ -1844,1500 +2120,8 @@ static void rs_make_default_outpath(const char *input_path, int is_edf, char *ou
   }
 }
 
-static bool rs_parse_date(const QString &date_part, QDate &out_date)
-{
-  QString d = date_part.trimmed();
-  if(d.isEmpty())  return false;
-
-  /* Accept:
-       YYYY-MM-DD
-       DD.MM.YYYY
-       DD.MM.YY
-  */
-  if(d.contains('-'))
-  {
-    const QStringList parts = d.split('-', Qt::SkipEmptyParts);
-    if(parts.size() == 3)
-    {
-      bool okY=false, okM=false, okD=false;
-      int y = parts[0].toInt(&okY);
-      int m = parts[1].toInt(&okM);
-      int day = parts[2].toInt(&okD);
-      if(okY && okM && okD)
-      {
-        QDate dt(y,m,day);
-        if(dt.isValid())
-        {
-          out_date = dt;
-          return true;
-        }
-      }
-    }
-  }
-
-  if(d.contains('.'))
-  {
-    const QStringList parts = d.split('.', Qt::SkipEmptyParts);
-    if(parts.size() == 3)
-    {
-      bool okD=false, okM=false, okY=false;
-      int day = parts[0].toInt(&okD);
-      int m = parts[1].toInt(&okM);
-      int y = parts[2].toInt(&okY);
-      if(okD && okM && okY)
-      {
-        if(y < 100) y += 2000;
-        QDate dt(y,m,day);
-        if(dt.isValid())
-        {
-          out_date = dt;
-          return true;
-        }
-      }
-    }
-  }
-
-  return false;
-}
-
-static bool rs_parse_time(const QString &time_part, QTime &out_time)
-{
-  QString t = time_part.trimmed();
-  if(t.isEmpty())  return false;
-
-  /* normalize common typos: HH-MM-SS -> HH:MM:SS */
-  t.replace('-', ':');
-
-  QString frac;
-  QString main = t;
-
-  if(t.contains('.'))
-  {
-    const int dot = t.indexOf('.');
-    main = t.left(dot);
-    frac = t.mid(dot + 1);
-  }
-  else
-  {
-    const QStringList parts0 = t.split(':', Qt::KeepEmptyParts);
-    if(parts0.size() == 4)
-    {
-      main = parts0[0] + ":" + parts0[1] + ":" + parts0[2];
-      frac = parts0[3];
-    }
-  }
-
-  const QStringList parts = main.split(':', Qt::SkipEmptyParts);
-  if(parts.size() < 2 || parts.size() > 3)  return false;
-
-  bool okH=false, okM=false, okS=true;
-  int h = parts[0].toInt(&okH);
-  int m = parts[1].toInt(&okM);
-  int s = 0;
-  if(parts.size() == 3)
-  {
-    s = parts[2].toInt(&okS);
-  }
-
-  if(!(okH && okM && okS))  return false;
-
-  int ms = 0;
-  if(!frac.isEmpty())
-  {
-    QString digits;
-    for(const QChar c : frac)
-    {
-      if(c.isDigit()) digits.append(c);
-      else break;
-    }
-    if(!digits.isEmpty())
-    {
-      if(digits.size() > 3) digits = digits.left(3);
-      while(digits.size() < 3) digits.append('0');
-      bool ok=false;
-      ms = digits.toInt(&ok);
-      if(!ok) ms = 0;
-    }
-  }
-
-  QTime qt(h,m,s,ms);
-  if(!qt.isValid())  return false;
-
-  out_time = qt;
-  return true;
-}
-
-static bool rs_parse_datetime_flexible(const QString &input,
-                                       const QDate &fallback_date,
-                                       QDateTime &out_dt,
-                                       bool &had_explicit_date,
-                                       QString &err)
-{
-  err.clear();
-  had_explicit_date = false;
-
-  QString s = input.trimmed();
-  if(s.isEmpty())
-  {
-    err = "Empty datetime string.";
-    return false;
-  }
-
-  s.replace('T', ' ');
-
-  QString datePart;
-  QString timePart;
-
-  const int sp = s.indexOf(' ');
-  if(sp >= 0)
-  {
-    datePart = s.left(sp).trimmed();
-    timePart = s.mid(sp + 1).trimmed();
-    had_explicit_date = true;
-  }
-  else
-  {
-    timePart = s;
-  }
-
-  QDate dt = fallback_date;
-  if(had_explicit_date)
-  {
-    if(!rs_parse_date(datePart, dt))
-    {
-      err = "Invalid date: " + datePart;
-      return false;
-    }
-  }
-
-  QTime tm;
-  if(!rs_parse_time(timePart, tm))
-  {
-    err = "Invalid time: " + timePart;
-    return false;
-  }
-
-  /* Interpret as UTC to align with edfhdr->utc_starttime usage. */
-  out_dt = QDateTime(dt, tm, Qt::UTC);
-  if(!out_dt.isValid())
-  {
-    err = "Invalid datetime: " + s;
-    return false;
-  }
-
-  return true;
-}
-
-/* Convert time window to datarecord range using the user's Python-style rounding.
-   - If input timestamps contain an explicit date, we use absolute time (UTC).
-   - If only time-of-day is supplied, we emulate the Python helper behavior including
-     a midnight wrap relative to the recording start time-of-day. */
-static bool rs_compute_record_range_from_timestamps(edfhdrblck_t *edfhdr,
-                                                    const reduce_signals_cli_options_t &opt,
-                                                    int &out_from_rec,
-                                                    int &out_to_rec,
-                                                    QString &err)
-{
-  err.clear();
-
-  if(edfhdr == NULL)
-  {
-    err = "Internal error: edfhdr is NULL.";
-    return false;
-  }
-
-  if(edfhdr->datarecords <= 0)
-  {
-    err = "File has no datarecords.";
-    return false;
-  }
-
-  const long long total_recs = edfhdr->datarecords;
-
-  if(total_recs > 2147483647LL)
-  {
-    err = "This tool cannot handle more than 2147483647 datarecords.";
-    return false;
-  }
-
-  QDateTime rec_start_dt = QDateTime::fromSecsSinceEpoch(edfhdr->utc_starttime, Qt::UTC);
-  QDate fallback_date = rec_start_dt.date();
-
-  /* Defaults */
-  QString from_str = QString::fromLocal8Bit(opt.from_timestamp).trimmed();
-  QString to_str   = QString::fromLocal8Bit(opt.to_timestamp).trimmed();
-
-  if(from_str.isEmpty() && to_str.isEmpty())
-  {
-    out_from_rec = opt.from_datarecord > 0 ? opt.from_datarecord : 1;
-    out_to_rec   = opt.to_datarecord > 0 ? opt.to_datarecord : (int)total_recs;
-    return true;
-  }
-
-  bool from_has_date = false;
-  bool to_has_date = false;
-  QDateTime from_dt, to_dt;
-
-  if(!from_str.isEmpty())
-  {
-    if(!rs_parse_datetime_flexible(from_str, fallback_date, from_dt, from_has_date, err))
-    {
-      err = "Invalid --from: " + err;
-      return false;
-    }
-  }
-
-  QDate to_fallback = fallback_date;
-  if(from_has_date) to_fallback = from_dt.date();
-
-  if(!to_str.isEmpty())
-  {
-    if(!rs_parse_datetime_flexible(to_str, to_fallback, to_dt, to_has_date, err))
-    {
-      err = "Invalid --to: " + err;
-      return false;
-    }
-  }
-
-  /* Apply offsets in minutes (like the Python helper) */
-  const int pre_off_s  = opt.pre_offset_minutes  * 60;
-  const int post_off_s = opt.post_offset_minutes * 60;
-
-  const double recdur_sec = edfhdr->data_record_duration > 0.0 ? edfhdr->data_record_duration : 1.0;
-
-  /* Path A: both timestamps are time-of-day only -> Python helper semantics */
-  if((!from_str.isEmpty() && !from_has_date) && (!to_str.isEmpty() && !to_has_date))
-  {
-    const QTime rec_tm = rec_start_dt.time();
-    const int rec_start_sod = rec_tm.hour() * 3600 + rec_tm.minute() * 60 + rec_tm.second();
-
-    const QTime from_tm = from_dt.time();
-    const QTime to_tm2 = to_dt.time();
-
-    int target_from_sod = from_tm.hour() * 3600 + from_tm.minute() * 60 + from_tm.second();
-    int target_to_sod   = to_tm2.hour() * 3600 + to_tm2.minute() * 60 + to_tm2.second();
-
-    int adjusted_start = target_from_sod - pre_off_s;
-    int adjusted_end   = target_to_sod + post_off_s;
-
-    if(adjusted_start < rec_start_sod) adjusted_start += 24 * 3600;
-    if(adjusted_end   < rec_start_sod) adjusted_end   += 24 * 3600;
-
-    double sec_from_start = (double)(adjusted_start - rec_start_sod);
-    double sec_to_end     = (double)(adjusted_end   - rec_start_sod);
-
-    const double total_duration_sec = (double)edfhdr->datarecords * recdur_sec;
-
-    if(sec_from_start < 0.0) sec_from_start = 0.0;
-    if(sec_to_end < 0.0) sec_to_end = 0.0;
-    if(sec_from_start > total_duration_sec) sec_from_start = total_duration_sec;
-    if(sec_to_end > total_duration_sec) sec_to_end = total_duration_sec;
-
-    long long from0 = llround(sec_from_start / recdur_sec);
-    long long to0_excl = llround(sec_to_end / recdur_sec);
-
-    long long from_rec = from0 + 1;
-    long long to_rec = to0_excl;
-
-    if(from_rec < 1) from_rec = 1;
-    if(to_rec < 1) to_rec = 1;
-    if(from_rec > total_recs) from_rec = total_recs;
-    if(to_rec > total_recs) to_rec = total_recs;
-
-    if(to_rec < from_rec)
-    {
-      err = QString("Invalid time window after conversion: from_rec=%1 > to_rec=%2").arg(from_rec).arg(to_rec);
-      return false;
-    }
-
-    out_from_rec = (int)from_rec;
-    out_to_rec = (int)to_rec;
-    return true;
-  }
-
-  /* Path B: any explicit date present -> absolute UTC timestamps */
-  auto dt_to_fixp = [](const QDateTime &dt) -> long long
-  {
-    const qint64 ms = dt.toMSecsSinceEpoch();
-    const qint64 sec = ms / 1000;
-    const qint64 rem_ms = ms % 1000;
-    return (long long)sec * TIME_FIXP_SCALING + (long long)rem_ms * 10000LL;
-  };
-
-  long long start_fixp = (long long)edfhdr->utc_starttime * TIME_FIXP_SCALING + (long long)edfhdr->starttime_subsec;
-
-  /* If only one side supplied, default the other to file bounds */
-  QDateTime adj_from = from_dt;
-  QDateTime adj_to = to_dt;
-
-  if(from_str.isEmpty())
-  {
-    adj_from = rec_start_dt;
-  }
-  if(to_str.isEmpty())
-  {
-    /* end time: recording start + total duration */
-    const long long total_fixp = (long long)edfhdr->datarecords * edfhdr->long_data_record_duration;
-    long long end_fixp = start_fixp + total_fixp;
-    const qint64 end_sec = end_fixp / TIME_FIXP_SCALING;
-    const qint64 end_ms  = (end_fixp % TIME_FIXP_SCALING) / 10000LL;
-    adj_to = QDateTime::fromSecsSinceEpoch(end_sec, Qt::UTC).addMSecs(end_ms);
-  }
-
-  if(pre_off_s)  adj_from = adj_from.addSecs(-pre_off_s);
-  if(post_off_s) adj_to   = adj_to.addSecs(+post_off_s);
-
-  long long from_fixp = dt_to_fixp(adj_from);
-  long long to_fixp   = dt_to_fixp(adj_to);
-
-  long long delta_from = from_fixp - start_fixp;
-  long long delta_to   = to_fixp   - start_fixp;
-
-  if(delta_from < 0LL) delta_from = 0LL;
-  if(delta_to < 0LL) delta_to = 0LL;
-
-  const long long total_fixp = (long long)edfhdr->datarecords * edfhdr->long_data_record_duration;
-  if(delta_from > total_fixp) delta_from = total_fixp;
-  if(delta_to > total_fixp) delta_to = total_fixp;
-
-  long long from0 = llround((double)delta_from / (double)edfhdr->long_data_record_duration);
-  long long to0_excl = llround((double)delta_to / (double)edfhdr->long_data_record_duration);
-
-  long long from_rec = from0 + 1;
-  long long to_rec = to0_excl;
-
-  if(from_rec < 1) from_rec = 1;
-  if(to_rec < 1) to_rec = 1;
-  if(from_rec > total_recs) from_rec = total_recs;
-  if(to_rec > total_recs) to_rec = total_recs;
-
-  if(to_rec < from_rec)
-  {
-    err = QString("Invalid time window after conversion: from_rec=%1 > to_rec=%2").arg(from_rec).arg(to_rec);
-    return false;
-  }
-
-  out_from_rec = (int)from_rec;
-  out_to_rec = (int)to_rec;
-  return true;
-}
-
-class rs_reduce_cli_runner
-{
-public:
-  rs_reduce_cli_runner(const char *in_path,
-                       const char *out_path,
-                       const reduce_signals_cli_options_t &opt,
-                       char *err_out,
-                       int err_out_sz)
-  : input_path_(in_path ? in_path : ""),
-    output_path_in_(out_path ? out_path : ""),
-    opt_(opt),
-    err_out_(err_out),
-    err_out_sz_(err_out_sz)
-  {
-    inputfile_ = NULL;
-    outputfile_ = NULL;
-    edfhdr_ = NULL;
-    readbuf_ = NULL;
-    memset(filterlist_, 0, sizeof(filterlist_));
-    memset(&new_annot_list_, 0, sizeof(annotlist_t));
-    out_path_[0] = 0;
-    memset(signalslist_, 0, sizeof(signalslist_));
-    memset(dividerlist_, 0, sizeof(dividerlist_));
-    new_edfsignals_ = 0;
-    annot_smp_per_record_ = 0;
-    annot_recordsize_ = 0;
-    timestamp_digits_ = 0;
-    timestamp_decimals_ = 0;
-    annot_len_ = 0;
-    annot_list_sz_ = 0;
-    annots_per_datrec_ = 0;
-    time_diff_ = 0LL;
-    taltime_ = 0LL;
-    endtime_ = 0LL;
-  }
-
-  ~rs_reduce_cli_runner()
-  {
-    if(outputfile_ != NULL)
-    {
-      fclose(outputfile_);
-      outputfile_ = NULL;
-    }
-
-    for(int i=0; i<MAXSIGNALS; i++)
-    {
-      for(int j=0; j<REDUCER_MAX_AA_FILTERS; j++)
-      {
-        if(filterlist_[i][j] != NULL)
-        {
-          free_ravg_filter(filterlist_[i][j]);
-          filterlist_[i][j] = NULL;
-        }
-      }
-    }
-
-    if(readbuf_ != NULL)
-    {
-      free(readbuf_);
-      readbuf_ = NULL;
-    }
-
-    edfplus_annotation_empty_list(&new_annot_list_);
-
-    if(edfhdr_ != NULL)
-    {
-      edfplus_annotation_empty_list(&edfhdr_->annot_list);
-
-      if(edfhdr_->edfparam != NULL)
-      {
-        free(edfhdr_->edfparam);
-        edfhdr_->edfparam = NULL;
-      }
-
-      free(edfhdr_);
-      edfhdr_ = NULL;
-    }
-
-    if(inputfile_ != NULL)
-    {
-      fclose(inputfile_);
-      inputfile_ = NULL;
-    }
-  }
-
-  int run()
-  {
-    if(input_path_.isEmpty())
-    {
-      rs_set_err(err_out_, err_out_sz_, "No input path provided.");
-      return 1;
-    }
-
-    if(opt_.from_datarecord <= 0) opt_.from_datarecord = 1;
-    if(opt_.aa_filter_order < 0) opt_.aa_filter_order = 0;
-    if(opt_.aa_filter_order > REDUCER_MAX_AA_FILTERS) opt_.aa_filter_order = REDUCER_MAX_AA_FILTERS;
-    if(opt_.global_samplerate_divider <= 0) opt_.global_samplerate_divider = 1;
-
-    if(!open_input_())
-    {
-      return 2;
-    }
-
-    if(edfhdr_->discontinuous)
-    {
-      rs_set_err(err_out_, err_out_sz_, "EDFbrowser cannot process EDF+D/BDF+D (discontinuous) files for reduction.");
-      return 3;
-    }
-
-    if(!resolve_output_path_())
-    {
-      return 4;
-    }
-
-    if(!apply_json_and_time_range_())
-    {
-      return 5;
-    }
-
-    if(!validate_range_())
-    {
-      return 6;
-    }
-
-    if(!build_signal_selection_())
-    {
-      return 7;
-    }
-
-    if(!prepare_annotations_())
-    {
-      return 8;
-    }
-
-    if(!allocate_buffers_and_filters_())
-    {
-      return 9;
-    }
-
-    if(!open_output_())
-    {
-      return 10;
-    }
-
-    if(!write_output_header_())
-    {
-      return 11;
-    }
-
-    if(!process_records_())
-    {
-      return 12;
-    }
-
-    rs_set_err(err_out_, err_out_sz_, "");
-    fprintf(stdout, "[reduce-signals] Done.\n");
-    return 0;
-  }
-
-private:
-  QString input_path_;
-  QString output_path_in_;
-  reduce_signals_cli_options_t opt_;
-  char *err_out_;
-  int err_out_sz_;
-
-  FILE *inputfile_;
-  FILE *outputfile_;
-  edfhdrblck_t *edfhdr_;
-  char *readbuf_;
-
-  ravgfiltset_t *filterlist_[MAXSIGNALS][REDUCER_MAX_AA_FILTERS];
-
-  /* selection */
-  int signalslist_[MAXSIGNALS];
-  int dividerlist_[MAXSIGNALS];
-  int new_edfsignals_;
-
-  /* output path */
-  char out_path_[MAX_PATH_LENGTH];
-
-  /* annotations for output */
-  annotlist_t new_annot_list_;
-  int annot_smp_per_record_;
-  int annot_recordsize_;
-  int timestamp_digits_;
-  int timestamp_decimals_;
-  int annot_len_;
-  int annot_list_sz_;
-  int annots_per_datrec_;
-  long long time_diff_;
-  long long taltime_;
-  long long endtime_;
-
-  bool open_input_()
-  {
-    char errbuf_local[4096] = {0};
-
-    inputfile_ = fopeno(input_path_.toLocal8Bit().constData(), "rb");
-    if(inputfile_ == NULL)
-    {
-      rs_set_err(err_out_, err_out_sz_, "Cannot open input file for reading: %s", input_path_.toLocal8Bit().constData());
-      return false;
-    }
-
-    edfhdr_ = check_edf_file(inputfile_, errbuf_local, sizeof(errbuf_local), 0, 0);
-    if(edfhdr_ == NULL)
-    {
-      rs_set_err(err_out_, err_out_sz_, "Not a valid EDF/BDF file: %s\n%s", input_path_.toLocal8Bit().constData(), errbuf_local);
-      return false;
-    }
-
-    strlcpy(edfhdr_->filename, input_path_.toLocal8Bit().constData(), MAX_PATH_LENGTH);
-    edfhdr_->file_hdl = inputfile_;
-
-    memset(&edfhdr_->annot_list, 0, sizeof(annotlist_t));
-
-    if((opt_.read_annotations != 0) && (edfhdr_->edfplus || edfhdr_->bdfplus))
-    {
-      EDF_annotations annotations;
-      annotations.get_annotations(edfhdr_, 0);
-
-      if(edfhdr_->annots_not_read)
-      {
-        edfplus_annotation_empty_list(&edfhdr_->annot_list);
-        fprintf(stderr, "[reduce-signals] Warning: annotations were not read; output will keep an empty annotation channel.\n");
-      }
-    }
-
-    return true;
-  }
-
-  bool resolve_output_path_()
-  {
-    /* Determine output path */
-    if(!output_path_in_.isEmpty())
-    {
-      strlcpy(out_path_, output_path_in_.toLocal8Bit().constData(), MAX_PATH_LENGTH);
-    }
-    else
-    {
-      rs_make_default_outpath(input_path_.toLocal8Bit().constData(), edfhdr_->edf, out_path_, MAX_PATH_LENGTH);
-    }
-
-    if(out_path_[0] == 0)
-    {
-      rs_set_err(err_out_, err_out_sz_, "No output path provided and default could not be formed.");
-      return false;
-    }
-
-    QFileInfo outInfo(QString::fromLocal8Bit(out_path_));
-    if(outInfo.exists() && (opt_.overwrite_existing == 0))
-    {
-      rs_set_err(err_out_, err_out_sz_, "Output file already exists (use --overwrite to allow): %s", out_path_);
-      return false;
-    }
-
-    return true;
-  }
-
-  bool apply_json_and_time_range_()
-  {
-    /* Apply JSON config if provided */
-    QMap<QString, int> json_label_to_divider;
-    bool json_has_range = false;
-    bool json_has_aa = false;
-    int json_from = opt_.from_datarecord;
-    int json_to = opt_.to_datarecord;
-    int json_aa = opt_.aa_filter_order;
-
-    if(opt_.json_config_path[0] != 0)
-    {
-      QString jerr;
-      if(!rs_load_json_config(QString::fromLocal8Bit(opt_.json_config_path),
-                              json_label_to_divider,
-                              json_has_range,
-                              json_from,
-                              json_to,
-                              json_has_aa,
-                              json_aa,
-                              jerr))
-      {
-        rs_set_err(err_out_, err_out_sz_, "%s", jerr.toLocal8Bit().constData());
-        return false;
-      }
-
-      if(json_has_range)
-      {
-        opt_.from_datarecord = json_from;
-        opt_.to_datarecord = json_to;
-      }
-
-      if(json_has_aa)
-      {
-        opt_.aa_filter_order = json_aa;
-        if(opt_.aa_filter_order < 0) opt_.aa_filter_order = 0;
-        if(opt_.aa_filter_order > REDUCER_MAX_AA_FILTERS) opt_.aa_filter_order = REDUCER_MAX_AA_FILTERS;
-      }
-    }
-
-    /* If user provided --from/--to timestamps, compute the datarecord range now (overrides JSON/record range). */
-    if((opt_.from_timestamp[0] != 0) || (opt_.to_timestamp[0] != 0))
-    {
-      QString terr;
-      int t_from = opt_.from_datarecord;
-      int t_to = opt_.to_datarecord;
-
-      if(!rs_compute_record_range_from_timestamps(edfhdr_, opt_, t_from, t_to, terr))
-      {
-        rs_set_err(err_out_, err_out_sz_, "%s", terr.toLocal8Bit().constData());
-        return false;
-      }
-
-      opt_.from_datarecord = t_from;
-      opt_.to_datarecord = t_to;
-
-      fprintf(stderr, "[reduce-signals] Converted time window to datarecords: %d..%d\n", t_from, t_to);
-    }
-
-    /* If to_datarecord omitted, default to end-of-file */
-    if(opt_.to_datarecord <= 0)
-    {
-      if(edfhdr_->datarecords > 2147483647LL)
-      {
-        rs_set_err(err_out_, err_out_sz_, "This tool cannot handle more than 2147483647 datarecords.");
-        return false;
-      }
-      opt_.to_datarecord = (int)edfhdr_->datarecords;
-    }
-
-    if(opt_.from_datarecord <= 0) opt_.from_datarecord = 1;
-
-    return true;
-  }
-
-  bool validate_range_()
-  {
-    if(opt_.from_datarecord < 1) opt_.from_datarecord = 1;
-
-    if(opt_.from_datarecord > opt_.to_datarecord)
-    {
-      rs_set_err(err_out_, err_out_sz_, "Invalid range: from_datarecord (%d) > to_datarecord (%d).",
-                 opt_.from_datarecord, opt_.to_datarecord);
-      return false;
-    }
-
-    if(opt_.to_datarecord > (int)edfhdr_->datarecords)
-    {
-      rs_set_err(err_out_, err_out_sz_, "Invalid range: to_datarecord (%d) exceeds file datarecords (%lli).",
-                 opt_.to_datarecord, edfhdr_->datarecords);
-      return false;
-    }
-
-    return true;
-  }
-
-  bool build_signal_selection_()
-  {
-    /* Re-load JSON (if any) just for selection map; this keeps run() logic clean */
-    QMap<QString, int> json_label_to_divider;
-    bool dummy_range=false, dummy_aa=false;
-    int dummy_from=opt_.from_datarecord, dummy_to=opt_.to_datarecord, dummy_aa_order=opt_.aa_filter_order;
-    QString dummy_err;
-
-    if(opt_.json_config_path[0] != 0)
-    {
-      rs_load_json_config(QString::fromLocal8Bit(opt_.json_config_path),
-                          json_label_to_divider,
-                          dummy_range, dummy_from, dummy_to,
-                          dummy_aa, dummy_aa_order,
-                          dummy_err);
-    }
-
-    int selected[MAXSIGNALS];
-    int divider_by_idx[MAXSIGNALS];
-
-    for(int i=0; i<edfhdr_->edfsignals; i++)
-    {
-      selected[i] = 0;
-      divider_by_idx[i] = 1;
-    }
-
-    const QString csv = QString::fromLocal8Bit(opt_.signals_csv).trimmed();
-
-    if(!json_label_to_divider.isEmpty())
-    {
-      QMapIterator<QString, int> it(json_label_to_divider);
-      while(it.hasNext())
-      {
-        it.next();
-
-        const QString label = it.key().trimmed();
-        const int div = it.value() > 0 ? it.value() : 1;
-
-        const int idx = rs_find_signal_index(edfhdr_, label);
-        if(idx < 0)
-        {
-          fprintf(stderr, "[reduce-signals] Warning: signal label not found, skipping: %s\n",
-                  label.toLocal8Bit().constData());
-          continue;
-        }
-
-        selected[idx] = 1;
-        divider_by_idx[idx] = div;
-      }
-    }
-    else if(csv.isEmpty() || (csv.compare("all", Qt::CaseInsensitive) == 0))
-    {
-      for(int i=0; i<edfhdr_->edfsignals; i++)
-      {
-        if(edfhdr_->edfparam[i].annotation)  continue;
-        selected[i] = 1;
-        divider_by_idx[i] = opt_.global_samplerate_divider;
-      }
-    }
-    else
-    {
-      const QStringList tokens = csv.split(',', Qt::SkipEmptyParts);
-
-      for(const QString &rawTok : tokens)
-      {
-        const QString tok = rawTok.trimmed();
-        if(tok.isEmpty())  continue;
-
-        QString left = tok;
-        QString right;
-
-        const int colonPos = tok.indexOf(':');
-        if(colonPos >= 0)
-        {
-          left = tok.left(colonPos).trimmed();
-          right = tok.mid(colonPos + 1).trimmed();
-        }
-
-        int divider = opt_.global_samplerate_divider;
-        if(!right.isEmpty())
-        {
-          bool ok = false;
-          divider = right.toInt(&ok);
-          if(!ok || (divider <= 0))
-          {
-            rs_set_err(err_out_, err_out_sz_, "Invalid samplerate divider in --signals token: %s",
-                       tok.toLocal8Bit().constData());
-            return false;
-          }
-        }
-
-        int idx = -1;
-
-        if(left.startsWith('#'))
-        {
-          bool ok = false;
-          idx = left.mid(1).toInt(&ok);
-          if(!ok) idx = -1;
-        }
-        else
-        {
-          idx = rs_find_signal_index(edfhdr_, left);
-
-          if(idx < 0)
-          {
-            bool ok = false;
-            idx = left.toInt(&ok);
-            if(!ok) idx = -1;
-          }
-        }
-
-        if((idx < 0) || (idx >= edfhdr_->edfsignals) || edfhdr_->edfparam[idx].annotation)
-        {
-          rs_set_err(err_out_, err_out_sz_, "Signal not found / invalid in --signals token: %s",
-                     tok.toLocal8Bit().constData());
-          return false;
-        }
-
-        selected[idx] = 1;
-        divider_by_idx[idx] = divider;
-      }
-    }
-
-    /* Apply mask filtering (if any) */
-    const QString mask_csv = QString::fromLocal8Bit(opt_.mask_signals).trimmed();
-    if(!mask_csv.isEmpty())
-    {
-      for(int i=0; i<edfhdr_->edfsignals; i++)
-      {
-        if(edfhdr_->edfparam[i].annotation)
-        {
-          selected[i] = 0;
-          continue;
-        }
-
-        if(!selected[i])  continue;
-
-        const QString lbl = rs_norm_label(edfhdr_->edfparam[i].label);
-        if(!rs_match_any_mask(lbl, mask_csv))
-        {
-          selected[i] = 0;
-        }
-      }
-    }
-
-    /* Validate and compact */
-    new_edfsignals_ = 0;
-
-    for(int i=0; i<edfhdr_->edfsignals; i++)
-    {
-      if(edfhdr_->edfparam[i].annotation)  continue;
-      if(!selected[i])  continue;
-
-      int div = divider_by_idx[i];
-      if(div <= 0) div = 1;
-
-      if(edfhdr_->edfparam[i].smp_per_record < div)
-      {
-        rs_set_err(err_out_, err_out_sz_,
-                   "Invalid divider for signal '%s': divider=%d exceeds smp/record=%d",
-                   rs_norm_label(edfhdr_->edfparam[i].label).toLocal8Bit().constData(),
-                   div, edfhdr_->edfparam[i].smp_per_record);
-        return false;
-      }
-
-      if((edfhdr_->edfparam[i].smp_per_record % div) != 0)
-      {
-        rs_set_err(err_out_, err_out_sz_,
-                   "Invalid divider for signal '%s': divider=%d must evenly divide smp/record=%d",
-                   rs_norm_label(edfhdr_->edfparam[i].label).toLocal8Bit().constData(),
-                   div, edfhdr_->edfparam[i].smp_per_record);
-        return false;
-      }
-
-      signalslist_[new_edfsignals_] = i;
-      dividerlist_[new_edfsignals_] = div;
-      new_edfsignals_++;
-    }
-
-    if(new_edfsignals_ < 1)
-    {
-      rs_set_err(err_out_, err_out_sz_, "No signals selected.");
-      return false;
-    }
-
-    return true;
-  }
-
-  bool prepare_annotations_()
-  {
-    const int datarecords = opt_.to_datarecord - opt_.from_datarecord + 1;
-
-    time_diff_ = (long long)(opt_.from_datarecord - 1) * edfhdr_->long_data_record_duration;
-    taltime_ = (time_diff_ + edfhdr_->starttime_subsec) % TIME_FIXP_SCALING;
-    endtime_ = (long long)(datarecords) * edfhdr_->long_data_record_duration + taltime_;
-
-    annot_smp_per_record_ = 0;
-    annot_recordsize_ = 0;
-    timestamp_digits_ = 0;
-    timestamp_decimals_ = 0;
-    annot_len_ = 0;
-    annot_list_sz_ = 0;
-    annots_per_datrec_ = 0;
-
-    if(!(edfhdr_->edfplus || edfhdr_->bdfplus))
-    {
-      return true;
-    }
-
-    timestamp_decimals_ = edfplus_annotation_get_tal_timestamp_decimal_cnt(edfhdr_);
-    if(timestamp_decimals_ < 0)
-    {
-      rs_set_err(err_out_, err_out_sz_, "Internal error: get_tal_timestamp_decimal_cnt()");
-      return false;
-    }
-
-    timestamp_digits_ = edfplus_annotation_get_tal_timestamp_digit_cnt(edfhdr_);
-    if(timestamp_digits_ < 0)
-    {
-      rs_set_err(err_out_, err_out_sz_, "Internal error: get_tal_timestamp_digit_cnt()");
-      return false;
-    }
-
-    annot_list_sz_ = edfplus_annotation_size(&edfhdr_->annot_list);
-
-    for(int i=0; i<annot_list_sz_; i++)
-    {
-      annotblck_t *annot_ptr = edfplus_annotation_get_item(&edfhdr_->annot_list, i);
-
-      long long l_temp = annot_ptr->onset - time_diff_;
-
-      if((l_temp >= 0LL) && (l_temp <= endtime_))
-      {
-        edfplus_annotation_add_item(&new_annot_list_, *annot_ptr);
-      }
-    }
-
-    const long long new_starttime = edfhdr_->utc_starttime + ((time_diff_ + edfhdr_->starttime_subsec) / TIME_FIXP_SCALING);
-    const long long onset_diff = (new_starttime - edfhdr_->utc_starttime) * TIME_FIXP_SCALING;
-
-    annot_list_sz_ = edfplus_annotation_size(&new_annot_list_);
-
-    if(annot_list_sz_ > 0)
-    {
-      for(int i=0; i<annot_list_sz_; i++)
-      {
-        annotblck_t *annot_ptr = edfplus_annotation_get_item(&new_annot_list_, i);
-        annot_ptr->onset -= onset_diff;
-      }
-
-      edfplus_annotation_sort(&new_annot_list_, NULL);
-
-      annots_per_datrec_ = annot_list_sz_ / datarecords;
-      if(annot_list_sz_ % datarecords)  annots_per_datrec_++;
-    }
-    else
-    {
-      annots_per_datrec_ = 0;
-    }
-
-    annot_len_ = edfplus_annotation_get_max_annotation_strlen(&new_annot_list_);
-
-    annot_recordsize_ = (annot_len_ * annots_per_datrec_) + timestamp_digits_ + timestamp_decimals_ + 4;
-    if(timestamp_decimals_)  annot_recordsize_++;
-
-    if(edfhdr_->edf)
-    {
-      annot_smp_per_record_ = annot_recordsize_ / 2;
-
-      if(annot_smp_per_record_ < 1) annot_smp_per_record_ = 1;
-
-      if(annot_recordsize_ % annot_smp_per_record_)
-      {
-        annot_smp_per_record_++;
-        annot_recordsize_ = annot_smp_per_record_ * 2;
-      }
-    }
-    else
-    {
-      annot_smp_per_record_ = annot_recordsize_ / 3;
-
-      if(annot_smp_per_record_ < 1) annot_smp_per_record_ = 1;
-
-      if(annot_recordsize_ % annot_smp_per_record_)
-      {
-        annot_smp_per_record_++;
-        annot_recordsize_ = annot_smp_per_record_ * 3;
-      }
-    }
-
-    return true;
-  }
-
-  bool allocate_buffers_and_filters_()
-  {
-    readbuf_ = (char *)malloc(edfhdr_->recordsize);
-    if(readbuf_ == NULL)
-    {
-      rs_set_err(err_out_, err_out_sz_, "Malloc error (readbuf).");
-      return false;
-    }
-
-    for(int i=0; i<new_edfsignals_; i++)
-    {
-      if(dividerlist_[i] > 1)
-      {
-        for(int j=0; j<opt_.aa_filter_order; j++)
-        {
-          filterlist_[i][j] = create_ravg_filter(1, dividerlist_[i]);
-          if(filterlist_[i][j] == NULL)
-          {
-            rs_set_err(err_out_, err_out_sz_, "Malloc error (create_ravg_filter()).");
-            return false;
-          }
-        }
-      }
-    }
-
-    return true;
-  }
-
-  bool open_output_()
-  {
-    outputfile_ = fopeno(out_path_, "wb");
-    if(outputfile_ == NULL)
-    {
-      rs_set_err(err_out_, err_out_sz_, "Cannot open output file for writing: %s", out_path_);
-      return false;
-    }
-
-    return true;
-  }
-
-  bool write_output_header_()
-  {
-    /* This header-writing code mirrors the GUI's StartConversion() logic. */
-    int i;
-    date_time_t dts;
-    char scratchpad_256[256] = {0};
-
-    const int datarecords = opt_.to_datarecord - opt_.from_datarecord + 1;
-
-    const long long new_starttime = edfhdr_->utc_starttime + ((time_diff_ + edfhdr_->starttime_subsec) / TIME_FIXP_SCALING);
-
-    utc_to_date_time(new_starttime, &dts);
-
-    rewind(inputfile_);
-    if(fread(scratchpad_256, 168, 1, inputfile_) != 1)
-    {
-      rs_set_err(err_out_, err_out_sz_, "Read error (header).");
-      return false;
-    }
-
-    if(edfhdr_->edfplus || edfhdr_->bdfplus)
-    {
-      if(scratchpad_256[98] != 'X')
-      {
-        snprintf(scratchpad_256 + 98, 256 - 98, "%02i-%s-%04i", dts.day, dts.month_str, dts.year);
-        scratchpad_256[109] = ' ';
-      }
-    }
-
-    if(fwrite(scratchpad_256, 168, 1, outputfile_) != 1)
-    {
-      rs_set_err(err_out_, err_out_sz_, "Write error (header 1).");
-      return false;
-    }
-
-    fprintf(outputfile_, "%02i.%02i.%02i%02i.%02i.%02i",
-            dts.day,
-            dts.month,
-            dts.year % 100,
-            dts.hour,
-            dts.minute,
-            dts.second);
-
-    if(edfhdr_->edfplus || edfhdr_->bdfplus)
-    {
-      fprintf(outputfile_, "%-8i", new_edfsignals_ * 256 + 512);
-    }
-    else
-    {
-      fprintf(outputfile_, "%-8i", new_edfsignals_ * 256 + 256);
-    }
-
-    if(edfhdr_->edfplus)
-    {
-      fprintf(outputfile_, "EDF+C");
-      for(i=0; i<39; i++)  fputc(' ', outputfile_);
-    }
-    if(edfhdr_->bdfplus)
-    {
-      fprintf(outputfile_, "BDF+C");
-      for(i=0; i<39; i++)  fputc(' ', outputfile_);
-    }
-    if((!edfhdr_->edfplus) && (!edfhdr_->bdfplus))
-    {
-      for(i=0; i<44; i++)  fputc(' ', outputfile_);
-    }
-
-    fprintf(outputfile_, "%-8i", datarecords);
-
-    snprintf(scratchpad_256, 256, "%f", edfhdr_->data_record_duration);
-    convert_trailing_zeros_to_spaces(scratchpad_256);
-    if(scratchpad_256[7]=='.')
-    {
-      scratchpad_256[7] = ' ';
-    }
-    scratchpad_256[8] = 0;
-    fprintf(outputfile_, "%s", scratchpad_256);
-
-    if(edfhdr_->edfplus || edfhdr_->bdfplus)
-    {
-      fprintf(outputfile_, "%-4i", new_edfsignals_ + 1);
-    }
-    else
-    {
-      fprintf(outputfile_, "%-4i", new_edfsignals_);
-    }
-
-    for(i=0; i<new_edfsignals_; i++)
-    {
-      fprintf(outputfile_, "%s", edfhdr_->edfparam[signalslist_[i]].label);
-    }
-    if(edfhdr_->edfplus)  fprintf(outputfile_, "EDF Annotations ");
-    if(edfhdr_->bdfplus)  fprintf(outputfile_, "BDF Annotations ");
-
-    for(i=0; i<new_edfsignals_; i++)
-    {
-      fprintf(outputfile_, "%s", edfhdr_->edfparam[signalslist_[i]].transducer);
-    }
-    if(edfhdr_->edfplus || edfhdr_->bdfplus)
-    {
-      for(i=0; i<80; i++)  fputc(' ', outputfile_);
-    }
-
-    for(i=0; i<new_edfsignals_; i++)
-    {
-      fprintf(outputfile_, "%s", edfhdr_->edfparam[signalslist_[i]].physdimension);
-    }
-    if(edfhdr_->edfplus || edfhdr_->bdfplus)
-    {
-      for(i=0; i<8; i++)  fputc(' ', outputfile_);
-    }
-
-    for(i=0; i<new_edfsignals_; i++)
-    {
-      snprintf(scratchpad_256, 256, "%f", edfhdr_->edfparam[signalslist_[i]].phys_min);
-      convert_trailing_zeros_to_spaces(scratchpad_256);
-      if(scratchpad_256[7]=='.')  scratchpad_256[7] = ' ';
-      scratchpad_256[8] = 0;
-      fprintf(outputfile_, "%s", scratchpad_256);
-    }
-    if(edfhdr_->edfplus || edfhdr_->bdfplus)  fprintf(outputfile_, "-1      ");
-
-    for(i=0; i<new_edfsignals_; i++)
-    {
-      snprintf(scratchpad_256, 256, "%f", edfhdr_->edfparam[signalslist_[i]].phys_max);
-      convert_trailing_zeros_to_spaces(scratchpad_256);
-      if(scratchpad_256[7]=='.')  scratchpad_256[7] = ' ';
-      scratchpad_256[8] = 0;
-      fprintf(outputfile_, "%s", scratchpad_256);
-    }
-    if(edfhdr_->edfplus || edfhdr_->bdfplus)  fprintf(outputfile_, "1       ");
-
-    for(i=0; i<new_edfsignals_; i++)
-    {
-      fprintf(outputfile_, "%-8i", edfhdr_->edfparam[signalslist_[i]].dig_min);
-    }
-    if(edfhdr_->edfplus) fprintf(outputfile_, "-32768  ");
-    if(edfhdr_->bdfplus) fprintf(outputfile_, "-8388608");
-
-    for(i=0; i<new_edfsignals_; i++)
-    {
-      fprintf(outputfile_, "%-8i", edfhdr_->edfparam[signalslist_[i]].dig_max);
-    }
-    if(edfhdr_->edfplus) fprintf(outputfile_, "32767   ");
-    if(edfhdr_->bdfplus) fprintf(outputfile_, "8388607 ");
-
-    for(i=0; i<new_edfsignals_; i++)
-    {
-      fprintf(outputfile_, "%s", edfhdr_->edfparam[signalslist_[i]].prefilter);
-    }
-    if(edfhdr_->edfplus || edfhdr_->bdfplus)
-    {
-      for(i=0; i<80; i++)  fputc(' ', outputfile_);
-    }
-
-    for(i=0; i<new_edfsignals_; i++)
-    {
-      fprintf(outputfile_, "%-8i", edfhdr_->edfparam[signalslist_[i]].smp_per_record / dividerlist_[i]);
-    }
-    if(edfhdr_->edfplus || edfhdr_->bdfplus)
-    {
-      fprintf(outputfile_, "%-8i", annot_smp_per_record_);
-    }
-
-    for(i=0; i<(new_edfsignals_ * 32); i++)  fputc(' ', outputfile_);
-    if(edfhdr_->edfplus || edfhdr_->bdfplus)
-    {
-      for(i=0; i<32; i++)  fputc(' ', outputfile_);
-    }
-
-    return true;
-  }
-
-  bool process_records_()
-  {
-    const int datarecords = opt_.to_datarecord - opt_.from_datarecord + 1;
-
-    fprintf(stdout, "[reduce-signals] Input:  %s\n", input_path_.toLocal8Bit().constData());
-    fprintf(stdout, "[reduce-signals] Output: %s\n", out_path_);
-    fprintf(stdout, "[reduce-signals] Records: %d..%d (%d records)\n",
-            opt_.from_datarecord, opt_.to_datarecord, datarecords);
-    fprintf(stdout, "[reduce-signals] Signals: %d\n", new_edfsignals_);
-    fprintf(stdout, "[reduce-signals] AA order: %d\n", opt_.aa_filter_order);
-
-    fseeko(inputfile_, (long long)edfhdr_->hdrsize + ((long long)(opt_.from_datarecord - 1) * (long long)edfhdr_->recordsize), SEEK_SET);
-
-    int annot_cnt = 0;
-
-    union {
-            unsigned int one;
-            signed int one_signed;
-            unsigned short two[2];
-            signed short two_signed[2];
-            unsigned char four[4];
-          } var;
-
-    const int progress_steps = (datarecords / 100) < 1 ? 1 : (datarecords / 100);
-
-    for(int datrecs_processed=0; datrecs_processed<datarecords; datrecs_processed++)
-    {
-      if(!(datrecs_processed % progress_steps))
-      {
-        fprintf(stdout, "\r[reduce-signals] %d/%d", datrecs_processed, datarecords);
-        fflush(stdout);
-      }
-
-      if(fread(readbuf_, edfhdr_->recordsize, 1, inputfile_) != 1)
-      {
-        rs_set_err(err_out_, err_out_sz_, "Read error (data).");
-        return false;
-      }
-
-      if(edfhdr_->edf)
-      {
-        for(int i=0; i<new_edfsignals_; i++)
-        {
-          int smplrt;
-          int tmp;
-          int val;
-
-          if(dividerlist_[i] == 1)
-          {
-            smplrt = edfhdr_->edfparam[signalslist_[i]].smp_per_record;
-
-            for(int j=0; j<smplrt; j++)
-            {
-              val = *(((signed short *)(readbuf_ + edfhdr_->edfparam[signalslist_[i]].datrec_offset)) + j);
-
-              if(val > edfhdr_->edfparam[signalslist_[i]].dig_max)  val = edfhdr_->edfparam[signalslist_[i]].dig_max;
-              else if(val < edfhdr_->edfparam[signalslist_[i]].dig_min)  val = edfhdr_->edfparam[signalslist_[i]].dig_min;
-
-              fputc(val & 0xff, outputfile_);
-              if(fputc(val >> 8, outputfile_) == EOF)
-              {
-                rs_set_err(err_out_, err_out_sz_, "Write error (EDF).");
-                return false;
-              }
-            }
-          }
-          else
-          {
-            smplrt = edfhdr_->edfparam[signalslist_[i]].smp_per_record / dividerlist_[i];
-
-            for(int j=0; j<smplrt; j++)
-            {
-              tmp = 0;
-
-              for(int k=0; k<dividerlist_[i]; k++)
-              {
-                val = *(((signed short *)(readbuf_ + edfhdr_->edfparam[signalslist_[i]].datrec_offset)) + (dividerlist_[i] * j) + k);
-
-                if(val > edfhdr_->edfparam[signalslist_[i]].dig_max)  val = edfhdr_->edfparam[signalslist_[i]].dig_max;
-                else if(val < edfhdr_->edfparam[signalslist_[i]].dig_min)  val = edfhdr_->edfparam[signalslist_[i]].dig_min;
-
-                for(int n=0; n<opt_.aa_filter_order; n++)
-                {
-                  val = run_ravg_filter(val, filterlist_[i][n]);
-                }
-
-                tmp += val;
-              }
-
-              tmp /= dividerlist_[i];
-
-              fputc(tmp & 0xff, outputfile_);
-              if(fputc((tmp >> 8) & 0xff, outputfile_) == EOF)
-              {
-                rs_set_err(err_out_, err_out_sz_, "Write error (EDF).");
-                return false;
-              }
-            }
-          }
-        }
-      }
-      else
-      {
-        for(int i=0; i<new_edfsignals_; i++)
-        {
-          int smplrt;
-
-          if(dividerlist_[i] == 1)
-          {
-            smplrt = edfhdr_->edfparam[signalslist_[i]].smp_per_record;
-
-            for(int j=0; j<smplrt; j++)
-            {
-              var.two[0] = *((unsigned short *)(readbuf_ + edfhdr_->edfparam[signalslist_[i]].datrec_offset + (j * 3)));
-              var.four[2] = *((unsigned char *)(readbuf_ + edfhdr_->edfparam[signalslist_[i]].datrec_offset + (j * 3) + 2));
-
-              if(var.four[2] & 0x80)  var.four[3] = 0xff;
-              else                    var.four[3] = 0x00;
-
-              if(var.one_signed > edfhdr_->edfparam[signalslist_[i]].dig_max)  var.one_signed = edfhdr_->edfparam[signalslist_[i]].dig_max;
-              else if(var.one_signed < edfhdr_->edfparam[signalslist_[i]].dig_min)  var.one_signed = edfhdr_->edfparam[signalslist_[i]].dig_min;
-
-              fputc(var.four[0], outputfile_);
-              fputc(var.four[1], outputfile_);
-              if(fputc(var.four[2], outputfile_) == EOF)
-              {
-                rs_set_err(err_out_, err_out_sz_, "Write error (BDF).");
-                return false;
-              }
-            }
-          }
-          else
-          {
-            smplrt = edfhdr_->edfparam[signalslist_[i]].smp_per_record / dividerlist_[i];
-
-            for(int j=0; j<smplrt; j++)
-            {
-              long long l_tmp = 0LL;
-
-              for(int k=0; k<dividerlist_[i]; k++)
-              {
-                var.two[0] = *((unsigned short *)(readbuf_ + edfhdr_->edfparam[signalslist_[i]].datrec_offset + (dividerlist_[i] * j * 3) + (k * 3)));
-                var.four[2] = *((unsigned char *)(readbuf_ + edfhdr_->edfparam[signalslist_[i]].datrec_offset + (dividerlist_[i] * j * 3) + (k * 3) + 2));
-
-                if(var.four[2] & 0x80)  var.four[3] = 0xff;
-                else                    var.four[3] = 0x00;
-
-                if(var.one_signed > edfhdr_->edfparam[signalslist_[i]].dig_max)  var.one_signed = edfhdr_->edfparam[signalslist_[i]].dig_max;
-                else if(var.one_signed < edfhdr_->edfparam[signalslist_[i]].dig_min)  var.one_signed = edfhdr_->edfparam[signalslist_[i]].dig_min;
-
-                for(int n=0; n<opt_.aa_filter_order; n++)
-                {
-                  var.one_signed = run_ravg_filter(var.one_signed, filterlist_[i][n]);
-                }
-
-                l_tmp += var.one_signed;
-              }
-
-              l_tmp /= dividerlist_[i];
-
-              fputc(l_tmp & 0xff, outputfile_);
-              fputc((l_tmp >> 8) & 0xff, outputfile_);
-              if(fputc((l_tmp >> 16) & 0xff, outputfile_) == EOF)
-              {
-                rs_set_err(err_out_, err_out_sz_, "Write error (BDF).");
-                return false;
-              }
-            }
-          }
-        }
-      }
-
-      if(edfhdr_->edfplus || edfhdr_->bdfplus)
-      {
-        int tallen = 0;
-
-        switch(timestamp_decimals_)
-        {
-          case 0 : tallen = fprintf(outputfile_, "+%i", (int)(taltime_ / TIME_FIXP_SCALING)); break;
-          case 1 : tallen = fprintf(outputfile_, "+%i.%01i", (int)(taltime_ / TIME_FIXP_SCALING), (int)((taltime_ % TIME_FIXP_SCALING) / 1000000LL)); break;
-          case 2 : tallen = fprintf(outputfile_, "+%i.%02i", (int)(taltime_ / TIME_FIXP_SCALING), (int)((taltime_ % TIME_FIXP_SCALING) / 100000LL)); break;
-          case 3 : tallen = fprintf(outputfile_, "+%i.%03i", (int)(taltime_ / TIME_FIXP_SCALING), (int)((taltime_ % TIME_FIXP_SCALING) / 10000LL)); break;
-          case 4 : tallen = fprintf(outputfile_, "+%i.%04i", (int)(taltime_ / TIME_FIXP_SCALING), (int)((taltime_ % TIME_FIXP_SCALING) / 1000LL)); break;
-          case 5 : tallen = fprintf(outputfile_, "+%i.%05i", (int)(taltime_ / TIME_FIXP_SCALING), (int)((taltime_ % TIME_FIXP_SCALING) / 100LL)); break;
-          case 6 : tallen = fprintf(outputfile_, "+%i.%06i", (int)(taltime_ / TIME_FIXP_SCALING), (int)((taltime_ % TIME_FIXP_SCALING) / 10LL)); break;
-          case 7 : tallen = fprintf(outputfile_, "+%i.%07i", (int)(taltime_ / TIME_FIXP_SCALING), (int)(taltime_ % TIME_FIXP_SCALING)); break;
-        }
-
-        fputc(20, outputfile_);
-        fputc(20, outputfile_);
-        fputc(0, outputfile_);
-        tallen += 3;
-
-        if(annot_cnt < annot_list_sz_)
-        {
-          for(int i=0; i<annots_per_datrec_; i++)
-          {
-            if(annot_cnt >= annot_list_sz_)  break;
-
-            annotblck_t *annot_ptr = edfplus_annotation_get_item(&new_annot_list_, annot_cnt++);
-
-            char scratchpad_256[256];
-            int len = snprintf(scratchpad_256, 256, "%+i.%07i",
-                               (int)(annot_ptr->onset / TIME_FIXP_SCALING),
-                               (int)(annot_ptr->onset % TIME_FIXP_SCALING));
-
-            int j;
-            for(j=0; j<7; j++)
-            {
-              if(scratchpad_256[len - j - 1] != '0')  break;
-            }
-
-            if(j)
-            {
-              len -= j;
-              if(j == 7)  len--;
-            }
-
-            if(fwrite(scratchpad_256, len, 1, outputfile_) != 1)
-            {
-              rs_set_err(err_out_, err_out_sz_, "Write error (annotations).");
-              return false;
-            }
-
-            tallen += len;
-
-            if(annot_ptr->duration[0] != 0)
-            {
-              fputc(21, outputfile_);
-              tallen++;
-              tallen += fprintf(outputfile_, "%s", annot_ptr->duration);
-            }
-
-            fputc(20, outputfile_);
-            tallen++;
-            tallen += fprintf(outputfile_, "%s", annot_ptr->description);
-
-            fputc(20, outputfile_);
-            fputc(0, outputfile_);
-            tallen += 2;
-          }
-        }
-
-        for(int k=tallen; k<annot_recordsize_; k++)  fputc(0, outputfile_);
-
-        taltime_ += edfhdr_->long_data_record_duration;
-      }
-    }
-
-    fprintf(stdout, "\r[reduce-signals] %d/%d\n", datarecords, datarecords);
-    return true;
-  }
-};
-
+/* Headless version of "Reduce signals, duration or samplerate".
+   Returns 0 on success, non-zero on failure. */
 int reduce_signals_cli(const char *input_path,
                        const char *output_path,
                        const reduce_signals_cli_options_t *opt_in,
@@ -3347,26 +2131,1020 @@ int reduce_signals_cli(const char *input_path,
   reduce_signals_cli_options_t opt;
   memset(&opt, 0, sizeof(opt));
 
-  /* Reasonable defaults for CLI */
-  opt.from_datarecord = 1;
-  opt.to_datarecord = 0;
-  opt.pre_offset_minutes = 0;
-  opt.post_offset_minutes = 0;
-  opt.aa_filter_order = 0;
-  opt.read_annotations = 1;
-  opt.overwrite_existing = 0;
-  opt.global_samplerate_divider = 1;
-  opt.signals_csv[0] = 0;
-  opt.mask_signals[0] = 0;
-  opt.json_config_path[0] = 0;
-  opt.from_timestamp[0] = 0;
-  opt.to_timestamp[0] = 0;
-
   if(opt_in != NULL)
   {
     opt = *opt_in;
   }
 
-  rs_reduce_cli_runner runner(input_path, output_path, opt, err_out, err_out_sz);
-  return runner.run();
+  if((input_path == NULL) || (input_path[0] == 0))
+  {
+    rs_set_err(err_out, err_out_sz, "No input path provided.");
+    return 1;
+  }
+
+  if(opt.from_datarecord <= 0)  opt.from_datarecord = 1;
+  if(opt.aa_filter_order < 0)   opt.aa_filter_order = 0;
+  if(opt.aa_filter_order > REDUCER_MAX_AA_FILTERS)  opt.aa_filter_order = REDUCER_MAX_AA_FILTERS;
+  if(opt.global_samplerate_divider <= 0) opt.global_samplerate_divider = 1;
+
+  FILE *inputfile = NULL;
+  FILE *outputfile = NULL;
+  edfhdrblck_t *edfhdr = NULL;
+
+  int signalslist[MAXSIGNALS];
+  int dividerlist[MAXSIGNALS];
+  int selected[MAXSIGNALS];
+
+  ravgfiltset_t *filterlist[MAXSIGNALS][REDUCER_MAX_AA_FILTERS];
+
+  memset(signalslist, 0, sizeof(signalslist));
+  memset(dividerlist, 0, sizeof(dividerlist));
+  memset(selected, 0, sizeof(selected));
+  memset(filterlist, 0, sizeof(filterlist));
+
+  char errbuf_local[4096] = {0};
+  char outputpath_local[MAX_PATH_LENGTH] = {0};
+
+  /* Open and parse input */
+  inputfile = fopeno(input_path, "rb");
+  if(inputfile == NULL)
+  {
+    rs_set_err(err_out, err_out_sz, "Cannot open input file for reading: %s", input_path);
+    return 2;
+  }
+
+  edfhdr = check_edf_file(inputfile, errbuf_local, sizeof(errbuf_local), 0, 0);
+  if(edfhdr == NULL)
+  {
+    rs_set_err(err_out, err_out_sz, "Not a valid EDF/BDF file: %s\n%s", input_path, errbuf_local);
+    fclose(inputfile);
+    return 3;
+  }
+
+  if(edfhdr->discontinuous)
+  {
+    rs_set_err(err_out, err_out_sz, "EDFbrowser cannot process EDF+D/BDF+D (discontinuous) files for reduction.");
+    free(edfhdr->edfparam);
+    free(edfhdr);
+    fclose(inputfile);
+    return 4;
+  }
+
+  strlcpy(edfhdr->filename, input_path, MAX_PATH_LENGTH);
+  edfhdr->file_hdl = inputfile;
+
+  memset(&edfhdr->annot_list, 0, sizeof(annotlist_t));
+
+  /* Optionally load annotations for EDF+/BDF+ */
+  if((opt.read_annotations != 0) && (edfhdr->edfplus || edfhdr->bdfplus))
+  {
+    EDF_annotations annotations;
+    annotations.get_annotations(edfhdr, 0);
+
+    if(edfhdr->annots_not_read)
+    {
+      edfplus_annotation_empty_list(&edfhdr->annot_list);
+      fprintf(stderr, "[reduce-signals] Warning: annotations were not read; output will keep an empty annotation channel.\n");
+    }
+  }
+
+  /* Determine output path */
+  if((output_path == NULL) || (output_path[0] == 0))
+  {
+    rs_make_default_outpath(input_path, edfhdr->edf, outputpath_local, MAX_PATH_LENGTH);
+    output_path = outputpath_local;
+  }
+
+  if((output_path == NULL) || (output_path[0] == 0))
+  {
+    rs_set_err(err_out, err_out_sz, "No output path provided and default could not be formed.");
+    edfplus_annotation_empty_list(&edfhdr->annot_list);
+    free(edfhdr->edfparam);
+    free(edfhdr);
+    fclose(inputfile);
+    return 5;
+  }
+
+  QFileInfo outInfo(QString::fromLocal8Bit(output_path));
+  if(outInfo.exists() && (opt.overwrite_existing == 0))
+  {
+    rs_set_err(err_out, err_out_sz, "Output file already exists (use --overwrite to allow): %s", output_path);
+    edfplus_annotation_empty_list(&edfhdr->annot_list);
+    free(edfhdr->edfparam);
+    free(edfhdr);
+    fclose(inputfile);
+    return 6;
+  }
+
+  /* Parse JSON config if provided */
+  QMap<QString, int> json_label_to_divider;
+  bool json_has_range = false;
+  bool json_has_aa = false;
+  int json_from = opt.from_datarecord;
+  int json_to = opt.to_datarecord;
+  int json_aa = opt.aa_filter_order;
+
+  if(opt.json_config_path[0] != 0)
+  {
+    QString jerr;
+    if(!rs_load_json_config(QString::fromLocal8Bit(opt.json_config_path),
+                            json_label_to_divider,
+                            json_has_range,
+                            json_from,
+                            json_to,
+                            json_has_aa,
+                            json_aa,
+                            jerr))
+    {
+      rs_set_err(err_out, err_out_sz, "%s", jerr.toLocal8Bit().constData());
+      edfplus_annotation_empty_list(&edfhdr->annot_list);
+      free(edfhdr->edfparam);
+      free(edfhdr);
+      fclose(inputfile);
+      return 7;
+    }
+
+    if(json_has_range)
+    {
+      opt.from_datarecord = json_from;
+      opt.to_datarecord = json_to;
+    }
+
+    if(json_has_aa)
+    {
+      opt.aa_filter_order = json_aa;
+      if(opt.aa_filter_order < 0) opt.aa_filter_order = 0;
+      if(opt.aa_filter_order > REDUCER_MAX_AA_FILTERS) opt.aa_filter_order = REDUCER_MAX_AA_FILTERS;
+    }
+  }
+
+  /* If user provided --from/--to timestamps, compute the datarecord range now (overrides JSON/record range). */
+  if((opt.from_timestamp[0] != 0) || (opt.to_timestamp[0] != 0))
+  {
+    QString terr;
+    int t_from = opt.from_datarecord;
+    int t_to = opt.to_datarecord;
+
+    if(!rs_compute_record_range_from_timestamps(edfhdr, opt, t_from, t_to, terr))
+    {
+      rs_set_err(err_out, err_out_sz, "%s", terr.toLocal8Bit().constData());
+      edfplus_annotation_empty_list(&edfhdr->annot_list);
+      free(edfhdr->edfparam);
+      free(edfhdr);
+      fclose(inputfile);
+      return 7;  /* reuse JSON error code slot */
+    }
+
+    opt.from_datarecord = t_from;
+    opt.to_datarecord = t_to;
+
+    fprintf(stderr, "[reduce-signals] Converted time window to datarecords: %d..%d\n",
+            opt.from_datarecord, opt.to_datarecord);
+  }
+
+  if(opt.to_datarecord <= 0)
+  {
+    if(edfhdr->datarecords > 2147483647LL)
+    {
+      rs_set_err(err_out, err_out_sz, "This tool cannot handle more than 2147483647 datarecords.");
+      edfplus_annotation_empty_list(&edfhdr->annot_list);
+      free(edfhdr->edfparam);
+      free(edfhdr);
+      fclose(inputfile);
+      return 8;
+    }
+    opt.to_datarecord = (int)edfhdr->datarecords;
+  }
+
+  if(opt.from_datarecord < 1) opt.from_datarecord = 1;
+  if(opt.from_datarecord > opt.to_datarecord)
+  {
+    rs_set_err(err_out, err_out_sz, "Invalid range: from_datarecord (%d) > to_datarecord (%d).",
+               opt.from_datarecord, opt.to_datarecord);
+    edfplus_annotation_empty_list(&edfhdr->annot_list);
+    free(edfhdr->edfparam);
+    free(edfhdr);
+    fclose(inputfile);
+    return 9;
+  }
+
+  if(opt.to_datarecord > (int)edfhdr->datarecords)
+  {
+    rs_set_err(err_out, err_out_sz, "Invalid range: to_datarecord (%d) exceeds file datarecords (%lli).",
+               opt.to_datarecord, edfhdr->datarecords);
+    edfplus_annotation_empty_list(&edfhdr->annot_list);
+    free(edfhdr->edfparam);
+    free(edfhdr);
+    fclose(inputfile);
+    return 10;
+  }
+
+  /* Build selection set */
+  for(int i=0; i<edfhdr->edfsignals; i++)
+  {
+    selected[i] = 0;
+    dividerlist[i] = 1;
+  }
+
+  const QString csv = QString::fromLocal8Bit(opt.signals_csv).trimmed();
+
+  if(!json_label_to_divider.isEmpty())
+  {
+    /* JSON-driven selection */
+    QMapIterator<QString, int> it(json_label_to_divider);
+    while(it.hasNext())
+    {
+      it.next();
+
+      const QString label = it.key().trimmed();
+      const int div = it.value() > 0 ? it.value() : 1;
+
+      const int idx = rs_find_signal_index(edfhdr, label);
+      if(idx < 0)
+      {
+        fprintf(stderr, "[reduce-signals] Warning: signal label not found in file, skipping: %s\n",
+                label.toLocal8Bit().constData());
+        continue;
+      }
+
+      selected[idx] = 1;
+      dividerlist[idx] = div;
+    }
+  }
+  else if(csv.isEmpty() || (csv.compare("all", Qt::CaseInsensitive) == 0))
+  {
+    /* Default: all non-annotation signals */
+    for(int i=0; i<edfhdr->edfsignals; i++)
+    {
+      if(edfhdr->edfparam[i].annotation)  continue;
+      selected[i] = 1;
+      dividerlist[i] = opt.global_samplerate_divider;
+    }
+  }
+  else
+  {
+    /* CSV parsing: token[,token...] each token can be:
+         label
+         index or #index
+         label:divider
+         #index:divider
+    */
+    const QStringList tokens = csv.split(',', Qt::SkipEmptyParts);
+
+    for(const QString &rawTok : tokens)
+    {
+      const QString tok = rawTok.trimmed();
+      if(tok.isEmpty())  continue;
+
+      QString left = tok;
+      QString right;
+
+      const int colonPos = tok.indexOf(':');
+      if(colonPos >= 0)
+      {
+        left = tok.left(colonPos).trimmed();
+        right = tok.mid(colonPos + 1).trimmed();
+      }
+
+      int divider = opt.global_samplerate_divider;
+      if(!right.isEmpty())
+      {
+        bool ok = false;
+        divider = right.toInt(&ok);
+        if(!ok || (divider <= 0))
+        {
+          rs_set_err(err_out, err_out_sz, "Invalid samplerate divider in --signals token: %s",
+                     tok.toLocal8Bit().constData());
+          edfplus_annotation_empty_list(&edfhdr->annot_list);
+          free(edfhdr->edfparam);
+          free(edfhdr);
+          fclose(inputfile);
+          return 11;
+        }
+      }
+
+      int idx = -1;
+
+      if(left.startsWith('#'))
+      {
+        bool ok = false;
+        idx = left.mid(1).toInt(&ok);
+        if(!ok) idx = -1;
+      }
+      else
+      {
+        idx = rs_find_signal_index(edfhdr, left);
+
+        if(idx < 0)
+        {
+          bool ok = false;
+          idx = left.toInt(&ok);
+          if(!ok) idx = -1;
+        }
+      }
+
+      if((idx < 0) || (idx >= edfhdr->edfsignals) || edfhdr->edfparam[idx].annotation)
+      {
+        rs_set_err(err_out, err_out_sz, "Signal not found / invalid in --signals token: %s",
+                   tok.toLocal8Bit().constData());
+        edfplus_annotation_empty_list(&edfhdr->annot_list);
+        free(edfhdr->edfparam);
+        free(edfhdr);
+        fclose(inputfile);
+        return 12;
+      }
+
+      selected[idx] = 1;
+      dividerlist[idx] = divider;
+    }
+  }
+
+  /* Apply --mask-signals wildcard filtering (if provided) */
+  const QString mask_csv = QString::fromLocal8Bit(opt.mask_signals).trimmed();
+  if(!mask_csv.isEmpty())
+  {
+    for(int i=0; i<edfhdr->edfsignals; i++)
+    {
+      if(edfhdr->edfparam[i].annotation)
+      {
+        selected[i] = 0;
+        continue;
+      }
+
+      if(!selected[i])  continue;
+
+      const QString lbl = rs_norm_label(edfhdr->edfparam[i].label);
+
+      if(!rs_match_any_mask(lbl, mask_csv))
+      {
+        selected[i] = 0;
+      }
+    }
+  }
+
+  /* Validate and build compact lists */
+  int new_edfsignals = 0;
+
+  for(int i=0; i<edfhdr->edfsignals; i++)
+  {
+    if(edfhdr->edfparam[i].annotation)  continue;
+    if(!selected[i])  continue;
+
+    int div = dividerlist[i];
+    if(div <= 0) div = 1;
+
+    if(edfhdr->edfparam[i].smp_per_record % div)
+    {
+      rs_set_err(err_out, err_out_sz,
+                 "Samplerate divider %d is not a divisor of smp_per_record=%d for signal '%s'.",
+                 div, edfhdr->edfparam[i].smp_per_record, rs_norm_label(edfhdr->edfparam[i].label).toLocal8Bit().constData());
+      edfplus_annotation_empty_list(&edfhdr->annot_list);
+      free(edfhdr->edfparam);
+      free(edfhdr);
+      fclose(inputfile);
+      return 13;
+    }
+
+    signalslist[new_edfsignals] = i;
+    dividerlist[new_edfsignals] = div;
+    new_edfsignals++;
+  }
+
+  if(new_edfsignals < 1)
+  {
+    rs_set_err(err_out, err_out_sz, "No signals selected.");
+    edfplus_annotation_empty_list(&edfhdr->annot_list);
+    free(edfhdr->edfparam);
+    free(edfhdr);
+    fclose(inputfile);
+    return 14;
+  }
+
+  /* Duration */
+  const int datarecords = opt.to_datarecord - opt.from_datarecord + 1;
+
+  /* Annotation setup (copy the original algorithm from the GUI tool) */
+  int annot_smp_per_record = 0;
+  int annot_recordsize = 0;
+  int timestamp_digits = 0;
+  int timestamp_decimals = 0;
+  int annot_len = 0;
+  int annot_list_sz = 0;
+  int annots_per_datrec = 0;
+
+  long long time_diff = (long long)(opt.from_datarecord - 1) * edfhdr->long_data_record_duration;
+  long long taltime = (time_diff + edfhdr->starttime_subsec) % TIME_FIXP_SCALING;
+  long long endtime = (long long)(datarecords) * edfhdr->long_data_record_duration + taltime;
+
+  annotlist_t new_annot_list;
+  memset(&new_annot_list, 0, sizeof(annotlist_t));
+
+  if(edfhdr->edfplus || edfhdr->bdfplus)
+  {
+    timestamp_decimals = edfplus_annotation_get_tal_timestamp_decimal_cnt(edfhdr);
+    if(timestamp_decimals < 0)
+    {
+      rs_set_err(err_out, err_out_sz, "Internal error: get_tal_timestamp_decimal_cnt()");
+      goto CLI_CLEANUP;
+    }
+
+    timestamp_digits = edfplus_annotation_get_tal_timestamp_digit_cnt(edfhdr);
+    if(timestamp_digits < 0)
+    {
+      rs_set_err(err_out, err_out_sz, "Internal error: get_tal_timestamp_digit_cnt()");
+      goto CLI_CLEANUP;
+    }
+
+    annot_list_sz = edfplus_annotation_size(&edfhdr->annot_list);
+
+    for(int i=0; i<annot_list_sz; i++)
+    {
+      annotblck_t *annot_ptr = edfplus_annotation_get_item(&edfhdr->annot_list, i);
+
+      long long l_temp = annot_ptr->onset - time_diff;
+
+      if((l_temp >= 0LL) && (l_temp <= endtime))
+      {
+        edfplus_annotation_add_item(&new_annot_list, *annot_ptr);
+      }
+    }
+
+    const long long new_starttime = edfhdr->utc_starttime + ((time_diff + edfhdr->starttime_subsec) / TIME_FIXP_SCALING);
+    const long long onset_diff = (new_starttime - edfhdr->utc_starttime) * TIME_FIXP_SCALING;
+
+    annot_list_sz = edfplus_annotation_size(&new_annot_list);
+
+    if(annot_list_sz > 0)
+    {
+      for(int i=0; i<annot_list_sz; i++)
+      {
+        annotblck_t *annot_ptr = edfplus_annotation_get_item(&new_annot_list, i);
+        annot_ptr->onset -= onset_diff;
+      }
+
+      edfplus_annotation_sort(&new_annot_list, NULL);
+
+      annots_per_datrec = annot_list_sz / datarecords;
+      if(annot_list_sz % datarecords)  annots_per_datrec++;
+    }
+    else
+    {
+      annots_per_datrec = 0;
+    }
+
+    annot_len = edfplus_annotation_get_max_annotation_strlen(&new_annot_list);
+
+    annot_recordsize = (annot_len * annots_per_datrec) + timestamp_digits + timestamp_decimals + 4;
+    if(timestamp_decimals)  annot_recordsize++;
+
+    if(edfhdr->edf)
+    {
+      annot_smp_per_record = annot_recordsize / 2;
+
+      if(annot_smp_per_record < 1) annot_smp_per_record = 1;
+
+      if(annot_recordsize % annot_smp_per_record)
+      {
+        annot_smp_per_record++;
+        annot_recordsize = annot_smp_per_record * 2;
+      }
+    }
+    else
+    {
+      annot_smp_per_record = annot_recordsize / 3;
+
+      if(annot_smp_per_record < 1) annot_smp_per_record = 1;
+
+      if(annot_recordsize % annot_smp_per_record)
+      {
+        annot_smp_per_record++;
+        annot_recordsize = annot_smp_per_record * 3;
+      }
+    }
+  }
+
+  /* Allocate read buffer */
+  char *readbuf = (char *)malloc(edfhdr->recordsize);
+  if(readbuf == NULL)
+  {
+    rs_set_err(err_out, err_out_sz, "Malloc error (readbuf).");
+    goto CLI_CLEANUP;
+  }
+
+  /* Build AA filters */
+  if(opt.aa_filter_order > 0)
+  {
+    for(int i=0; i<new_edfsignals; i++)
+    {
+      if(dividerlist[i] > 1)
+      {
+        for(int j=0; j<opt.aa_filter_order; j++)
+        {
+          filterlist[i][j] = create_ravg_filter(1, dividerlist[i]);
+          if(filterlist[i][j] == NULL)
+          {
+            rs_set_err(err_out, err_out_sz, "Malloc error (create_ravg_filter).");
+            free(readbuf);
+            readbuf = NULL;
+            goto CLI_CLEANUP;
+          }
+        }
+      }
+    }
+  }
+
+  /* Open output */
+  outputfile = fopeno(output_path, "wb");
+  if(outputfile == NULL)
+  {
+    rs_set_err(err_out, err_out_sz, "Cannot open output file for writing: %s", output_path);
+    free(readbuf);
+    readbuf = NULL;
+    goto CLI_CLEANUP;
+  }
+
+  /* Write header (copy from GUI tool) */
+  date_time_t dts;
+  const long long new_starttime2 = edfhdr->utc_starttime + ((time_diff + edfhdr->starttime_subsec) / TIME_FIXP_SCALING);
+
+  utc_to_date_time(new_starttime2, &dts);
+
+  rewind(inputfile);
+  char scratchpad_256[256] = {0};
+
+  if(fread(scratchpad_256, 168, 1, inputfile) != 1)
+  {
+    rs_set_err(err_out, err_out_sz, "Read error (header).");
+    free(readbuf);
+    readbuf = NULL;
+    goto CLI_CLEANUP;
+  }
+
+  if(edfhdr->edfplus || edfhdr->bdfplus)
+  {
+    if(scratchpad_256[98] != 'X')
+    {
+      snprintf(scratchpad_256 + 98, 256 - 98, "%02i-%s-%04i", dts.day, dts.month_str, dts.year);
+      scratchpad_256[109] = ' ';
+    }
+  }
+
+  if(fwrite(scratchpad_256, 168, 1, outputfile) != 1)
+  {
+    rs_set_err(err_out, err_out_sz, "Write error (header 1).");
+    free(readbuf);
+    readbuf = NULL;
+    goto CLI_CLEANUP;
+  }
+
+  fprintf(outputfile, "%02i.%02i.%02i%02i.%02i.%02i",
+          dts.day,
+          dts.month,
+          dts.year % 100,
+          dts.hour,
+          dts.minute,
+          dts.second);
+
+  if(edfhdr->edfplus || edfhdr->bdfplus)
+  {
+    fprintf(outputfile, "%-8i", new_edfsignals * 256 + 512);
+  }
+  else
+  {
+    fprintf(outputfile, "%-8i", new_edfsignals * 256 + 256);
+  }
+
+  if(edfhdr->edfplus)
+  {
+    fprintf(outputfile, "EDF+C");
+    for(int i=0; i<39; i++)  fputc(' ', outputfile);
+  }
+  if(edfhdr->bdfplus)
+  {
+    fprintf(outputfile, "BDF+C");
+    for(int i=0; i<39; i++)  fputc(' ', outputfile);
+  }
+  if((!edfhdr->edfplus) && (!edfhdr->bdfplus))
+  {
+    for(int i=0; i<44; i++)  fputc(' ', outputfile);
+  }
+
+  fprintf(outputfile, "%-8i", datarecords);
+
+  {
+    char tmpbuf[256];
+    snprintf(tmpbuf, 256, "%f", edfhdr->data_record_duration);
+    convert_trailing_zeros_to_spaces(tmpbuf);
+    if(tmpbuf[7] == '.')  tmpbuf[7] = ' ';
+    tmpbuf[8] = 0;
+    fprintf(outputfile, "%s", tmpbuf);
+  }
+
+  if(edfhdr->edfplus || edfhdr->bdfplus)
+  {
+    fprintf(outputfile, "%-4i", new_edfsignals + 1);
+  }
+  else
+  {
+    fprintf(outputfile, "%-4i", new_edfsignals);
+  }
+
+  for(int i=0; i<new_edfsignals; i++)
+  {
+    fprintf(outputfile, "%s", edfhdr->edfparam[signalslist[i]].label);
+  }
+  if(edfhdr->edfplus)  fprintf(outputfile, "EDF Annotations ");
+  if(edfhdr->bdfplus)  fprintf(outputfile, "BDF Annotations ");
+
+  for(int i=0; i<new_edfsignals; i++)
+  {
+    fprintf(outputfile, "%s", edfhdr->edfparam[signalslist[i]].transducer);
+  }
+  if(edfhdr->edfplus || edfhdr->bdfplus)
+  {
+    for(int i=0; i<80; i++)  fputc(' ', outputfile);
+  }
+
+  for(int i=0; i<new_edfsignals; i++)
+  {
+    fprintf(outputfile, "%s", edfhdr->edfparam[signalslist[i]].physdimension);
+  }
+  if(edfhdr->edfplus || edfhdr->bdfplus)
+  {
+    for(int i=0; i<8; i++)  fputc(' ', outputfile);
+  }
+
+  for(int i=0; i<new_edfsignals; i++)
+  {
+    char tmpbuf[256];
+    snprintf(tmpbuf, 256, "%f", edfhdr->edfparam[signalslist[i]].phys_min);
+    convert_trailing_zeros_to_spaces(tmpbuf);
+    if(tmpbuf[7] == '.')  tmpbuf[7] = ' ';
+    tmpbuf[8] = 0;
+    fprintf(outputfile, "%s", tmpbuf);
+  }
+  if(edfhdr->edfplus || edfhdr->bdfplus)  fprintf(outputfile, "-1      ");
+
+  for(int i=0; i<new_edfsignals; i++)
+  {
+    char tmpbuf[256];
+    snprintf(tmpbuf, 256, "%f", edfhdr->edfparam[signalslist[i]].phys_max);
+    convert_trailing_zeros_to_spaces(tmpbuf);
+    if(tmpbuf[7] == '.')  tmpbuf[7] = ' ';
+    tmpbuf[8] = 0;
+    fprintf(outputfile, "%s", tmpbuf);
+  }
+  if(edfhdr->edfplus || edfhdr->bdfplus)  fprintf(outputfile, "1       ");
+
+  for(int i=0; i<new_edfsignals; i++)
+  {
+    fprintf(outputfile, "%-8i", edfhdr->edfparam[signalslist[i]].dig_min);
+  }
+  if(edfhdr->edfplus) fprintf(outputfile, "-32768  ");
+  if(edfhdr->bdfplus) fprintf(outputfile, "-8388608");
+
+  for(int i=0; i<new_edfsignals; i++)
+  {
+    fprintf(outputfile, "%-8i", edfhdr->edfparam[signalslist[i]].dig_max);
+  }
+  if(edfhdr->edfplus) fprintf(outputfile, "32767   ");
+  if(edfhdr->bdfplus) fprintf(outputfile, "8388607 ");
+
+  for(int i=0; i<new_edfsignals; i++)
+  {
+    fprintf(outputfile, "%s", edfhdr->edfparam[signalslist[i]].prefilter);
+  }
+  if(edfhdr->edfplus || edfhdr->bdfplus)
+  {
+    for(int i=0; i<80; i++)  fputc(' ', outputfile);
+  }
+
+  for(int i=0; i<new_edfsignals; i++)
+  {
+    fprintf(outputfile, "%-8i", edfhdr->edfparam[signalslist[i]].smp_per_record / dividerlist[i]);
+  }
+  if(edfhdr->edfplus || edfhdr->bdfplus)
+  {
+    fprintf(outputfile, "%-8i", annot_smp_per_record);
+  }
+
+  for(int i=0; i<(new_edfsignals * 32); i++)  fputc(' ', outputfile);
+  if(edfhdr->edfplus || edfhdr->bdfplus)
+  {
+    for(int i=0; i<32; i++)  fputc(' ', outputfile);
+  }
+
+  /* Process datarecords */
+  fprintf(stdout, "[reduce-signals] Input:  %s\n", input_path);
+  fprintf(stdout, "[reduce-signals] Output: %s\n", output_path);
+  fprintf(stdout, "[reduce-signals] Records: %d..%d (%d records)\n", opt.from_datarecord, opt.to_datarecord, datarecords);
+  fprintf(stdout, "[reduce-signals] Signals: %d\n", new_edfsignals);
+  fprintf(stdout, "[reduce-signals] AA order: %d\n", opt.aa_filter_order);
+
+  fseeko(inputfile, (long long)edfhdr->hdrsize + ((long long)(opt.from_datarecord - 1) * (long long)edfhdr->recordsize), SEEK_SET);
+
+  int annot_cnt = 0;
+
+  union {
+          unsigned int one;
+          signed int one_signed;
+          unsigned short two[2];
+          signed short two_signed[2];
+          unsigned char four[4];
+        } var;
+
+  const int progress_steps = (datarecords / 100) < 1 ? 1 : (datarecords / 100);
+
+  for(int datrecs_processed=0; datrecs_processed<datarecords; datrecs_processed++)
+  {
+    if(!(datrecs_processed % progress_steps))
+    {
+      fprintf(stdout, "\r[reduce-signals] %d/%d", datrecs_processed, datarecords);
+      fflush(stdout);
+    }
+
+    if(fread(readbuf, edfhdr->recordsize, 1, inputfile) != 1)
+    {
+      rs_set_err(err_out, err_out_sz, "Read error (data).");
+      break;
+    }
+
+    if(edfhdr->edf)
+    {
+      for(int i=0; i<new_edfsignals; i++)
+      {
+        int smplrt;
+        int tmp;
+        int val;
+
+        if(dividerlist[i] == 1)
+        {
+          smplrt = edfhdr->edfparam[signalslist[i]].smp_per_record;
+
+          for(int j=0; j<smplrt; j++)
+          {
+            val = *(((signed short *)(readbuf + edfhdr->edfparam[signalslist[i]].datrec_offset)) + j);
+
+            if(val > edfhdr->edfparam[signalslist[i]].dig_max)  val = edfhdr->edfparam[signalslist[i]].dig_max;
+            else if(val < edfhdr->edfparam[signalslist[i]].dig_min)  val = edfhdr->edfparam[signalslist[i]].dig_min;
+
+            fputc(val & 0xff, outputfile);
+            if(fputc(val >> 8, outputfile) == EOF)
+            {
+              rs_set_err(err_out, err_out_sz, "Write error (EDF).");
+              goto CLI_LOOP_ABORT;
+            }
+          }
+        }
+        else
+        {
+          smplrt = edfhdr->edfparam[signalslist[i]].smp_per_record / dividerlist[i];
+
+          for(int j=0; j<smplrt; j++)
+          {
+            tmp = 0;
+
+            for(int k=0; k<dividerlist[i]; k++)
+            {
+              val = *(((signed short *)(readbuf + edfhdr->edfparam[signalslist[i]].datrec_offset)) + (dividerlist[i] * j) + k);
+
+              if(val > edfhdr->edfparam[signalslist[i]].dig_max)  val = edfhdr->edfparam[signalslist[i]].dig_max;
+              else if(val < edfhdr->edfparam[signalslist[i]].dig_min)  val = edfhdr->edfparam[signalslist[i]].dig_min;
+
+              for(int n=0; n<opt.aa_filter_order; n++)
+              {
+                val = run_ravg_filter(val, filterlist[i][n]);
+              }
+
+              tmp += val;
+            }
+
+            tmp /= dividerlist[i];
+
+            fputc(tmp & 0xff, outputfile);
+            if(fputc((tmp >> 8) & 0xff, outputfile) == EOF)
+            {
+              rs_set_err(err_out, err_out_sz, "Write error (EDF).");
+              goto CLI_LOOP_ABORT;
+            }
+          }
+        }
+      }
+    }
+    else
+    {
+      for(int i=0; i<new_edfsignals; i++)
+      {
+        int smplrt;
+
+        if(dividerlist[i] == 1)
+        {
+          smplrt = edfhdr->edfparam[signalslist[i]].smp_per_record;
+
+          for(int j=0; j<smplrt; j++)
+          {
+            var.two[0] = *((unsigned short *)(readbuf + edfhdr->edfparam[signalslist[i]].datrec_offset + (j * 3)));
+            var.four[2] = *((unsigned char *)(readbuf + edfhdr->edfparam[signalslist[i]].datrec_offset + (j * 3) + 2));
+
+            if(var.four[2] & 0x80)  var.four[3] = 0xff;
+            else                    var.four[3] = 0x00;
+
+            if(var.one_signed > edfhdr->edfparam[signalslist[i]].dig_max)  var.one_signed = edfhdr->edfparam[signalslist[i]].dig_max;
+            else if(var.one_signed < edfhdr->edfparam[signalslist[i]].dig_min)  var.one_signed = edfhdr->edfparam[signalslist[i]].dig_min;
+
+            fputc(var.four[0], outputfile);
+            fputc(var.four[1], outputfile);
+            if(fputc(var.four[2], outputfile) == EOF)
+            {
+              rs_set_err(err_out, err_out_sz, "Write error (BDF).");
+              goto CLI_LOOP_ABORT;
+            }
+          }
+        }
+        else
+        {
+          smplrt = edfhdr->edfparam[signalslist[i]].smp_per_record / dividerlist[i];
+
+          for(int j=0; j<smplrt; j++)
+          {
+            long long l_tmp = 0LL;
+
+            for(int k=0; k<dividerlist[i]; k++)
+            {
+              var.two[0] = *((unsigned short *)(readbuf + edfhdr->edfparam[signalslist[i]].datrec_offset + (dividerlist[i] * j * 3) + (k * 3)));
+              var.four[2] = *((unsigned char *)(readbuf + edfhdr->edfparam[signalslist[i]].datrec_offset + (dividerlist[i] * j * 3) + (k * 3) + 2));
+
+              if(var.four[2] & 0x80)  var.four[3] = 0xff;
+              else                    var.four[3] = 0x00;
+
+              if(var.one_signed > edfhdr->edfparam[signalslist[i]].dig_max)  var.one_signed = edfhdr->edfparam[signalslist[i]].dig_max;
+              else if(var.one_signed < edfhdr->edfparam[signalslist[i]].dig_min)  var.one_signed = edfhdr->edfparam[signalslist[i]].dig_min;
+
+              for(int n=0; n<opt.aa_filter_order; n++)
+              {
+                var.one_signed = run_ravg_filter(var.one_signed, filterlist[i][n]);
+              }
+
+              l_tmp += var.one_signed;
+            }
+
+            l_tmp /= dividerlist[i];
+
+            fputc(l_tmp & 0xff, outputfile);
+            fputc((l_tmp >> 8) & 0xff, outputfile);
+            if(fputc((l_tmp >> 16) & 0xff, outputfile) == EOF)
+            {
+              rs_set_err(err_out, err_out_sz, "Write error (BDF).");
+              goto CLI_LOOP_ABORT;
+            }
+          }
+        }
+      }
+    }
+
+    if(edfhdr->edfplus || edfhdr->bdfplus)
+    {
+      int tallen = 0;
+
+      switch(timestamp_decimals)
+      {
+        case 0 : tallen = fprintf(outputfile, "+%i", (int)(taltime / TIME_FIXP_SCALING)); break;
+        case 1 : tallen = fprintf(outputfile, "+%i.%01i", (int)(taltime / TIME_FIXP_SCALING), (int)((taltime % TIME_FIXP_SCALING) / 1000000LL)); break;
+        case 2 : tallen = fprintf(outputfile, "+%i.%02i", (int)(taltime / TIME_FIXP_SCALING), (int)((taltime % TIME_FIXP_SCALING) / 100000LL)); break;
+        case 3 : tallen = fprintf(outputfile, "+%i.%03i", (int)(taltime / TIME_FIXP_SCALING), (int)((taltime % TIME_FIXP_SCALING) / 10000LL)); break;
+        case 4 : tallen = fprintf(outputfile, "+%i.%04i", (int)(taltime / TIME_FIXP_SCALING), (int)((taltime % TIME_FIXP_SCALING) / 1000LL)); break;
+        case 5 : tallen = fprintf(outputfile, "+%i.%05i", (int)(taltime / TIME_FIXP_SCALING), (int)((taltime % TIME_FIXP_SCALING) / 100LL)); break;
+        case 6 : tallen = fprintf(outputfile, "+%i.%06i", (int)(taltime / TIME_FIXP_SCALING), (int)((taltime % TIME_FIXP_SCALING) / 10LL)); break;
+        case 7 : tallen = fprintf(outputfile, "+%i.%07i", (int)(taltime / TIME_FIXP_SCALING), (int)(taltime % TIME_FIXP_SCALING)); break;
+      }
+
+      fputc(20, outputfile);
+      fputc(20, outputfile);
+      fputc(0, outputfile);
+      tallen += 3;
+
+      if(annot_cnt < annot_list_sz)
+      {
+        for(int i=0; i<annots_per_datrec; i++)
+        {
+          if(annot_cnt >= annot_list_sz)  break;
+
+          annotblck_t *annot_ptr = edfplus_annotation_get_item(&new_annot_list, annot_cnt++);
+
+          int len = snprintf(scratchpad_256, 256, "%+i.%07i",
+                             (int)(annot_ptr->onset / TIME_FIXP_SCALING),
+                             (int)(annot_ptr->onset % TIME_FIXP_SCALING));
+
+          int j;
+          for(j=0; j<7; j++)
+          {
+            if(scratchpad_256[len - j - 1] != '0')  break;
+          }
+
+          if(j)
+          {
+            len -= j;
+            if(j == 7)  len--;
+          }
+
+          if(fwrite(scratchpad_256, len, 1, outputfile) != 1)
+          {
+            rs_set_err(err_out, err_out_sz, "Write error (annotations).");
+            goto CLI_LOOP_ABORT;
+          }
+
+          tallen += len;
+
+          if(annot_ptr->duration[0] != 0)
+          {
+            fputc(21, outputfile);
+            tallen++;
+            tallen += fprintf(outputfile, "%s", annot_ptr->duration);
+          }
+
+          fputc(20, outputfile);
+          tallen++;
+          tallen += fprintf(outputfile, "%s", annot_ptr->description);
+
+          fputc(20, outputfile);
+          fputc(0, outputfile);
+          tallen += 2;
+        }
+      }
+
+      for(int k=tallen; k<annot_recordsize; k++)  fputc(0, outputfile);
+
+      taltime += edfhdr->long_data_record_duration;
+    }
+  }
+
+CLI_LOOP_ABORT:
+  fprintf(stdout, "\r[reduce-signals] %d/%d\n", datarecords, datarecords);
+
+  if((err_out != NULL) && (err_out[0] != 0))
+  {
+    /* error already set */
+  }
+  else
+  {
+    rs_set_err(err_out, err_out_sz, "");
+  }
+
+  if(readbuf != NULL)
+  {
+    free(readbuf);
+    readbuf = NULL;
+  }
+
+CLI_CLEANUP:
+
+  /* Close output */
+  if(outputfile != NULL)
+  {
+    fclose(outputfile);
+    outputfile = NULL;
+  }
+
+  /* Free AA filters */
+  for(int i=0; i<MAXSIGNALS; i++)
+  {
+    for(int j=0; j<REDUCER_MAX_AA_FILTERS; j++)
+    {
+      if(filterlist[i][j] != NULL)
+      {
+        free_ravg_filter(filterlist[i][j]);
+        filterlist[i][j] = NULL;
+      }
+    }
+  }
+
+  edfplus_annotation_empty_list(&new_annot_list);
+
+  /* Cleanup input/header */
+  if(edfhdr != NULL)
+  {
+    edfplus_annotation_empty_list(&edfhdr->annot_list);
+
+    if(edfhdr->edfparam != NULL)
+    {
+      free(edfhdr->edfparam);
+      edfhdr->edfparam = NULL;
+    }
+    free(edfhdr);
+    edfhdr = NULL;
+  }
+
+  if(inputfile != NULL)
+  {
+    fclose(inputfile);
+    inputfile = NULL;
+  }
+
+  if((err_out != NULL) && (err_out[0] != 0))
+  {
+    return 99;
+  }
+
+  fprintf(stdout, "[reduce-signals] Done.\n");
+  return 0;
 }

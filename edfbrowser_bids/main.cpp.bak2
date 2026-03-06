@@ -78,8 +78,9 @@ void save_check_result(const char* edf_file_path, bool passed, const char* outpu
     QString base_name = file_info.completeBaseName();
     QString dir_path = file_info.absolutePath();
     
-    // Create temporary output file name (will be renamed later based on pass/fail)
-    QString out_filename = base_name + ".edf_temp";
+    // Create output file name with appropriate extension
+    QString result_ext = passed ? ".edf_pass" : ".edf_fail";
+    QString out_filename = base_name + result_ext;
     QString out_fullpath = QDir(dir_path).filePath(out_filename);
     
     // Get current timestamp
@@ -87,85 +88,80 @@ void save_check_result(const char* edf_file_path, bool passed, const char* outpu
     QString timestamp = current_time.toString("yyyy-MM-dd HH:mm:ss");
     
     // Open file for writing
-    g_output_file = fopen(out_fullpath.toLocal8Bit().constData(), "w");
-    if (g_output_file == NULL) {
+    FILE* out_file = fopen(out_fullpath.toLocal8Bit().constData(), "w");
+    if (out_file == NULL) {
         qCritical() << "Failed to create output file:" << out_fullpath;
-        return false;
-    }
-    
-    // Write header to file
-    fprintf(g_output_file, "Timestamp: %s\n", timestamp.toLocal8Bit().constData());
-    fprintf(g_output_file, "File: %s\n", edf_file_path);
-    fprintf(g_output_file, "\nOutput:\n");
-    
-    return true;
-}
-
-// Function to finalize the output file and rename it based on the result
-void finalize_output_file(const char* edf_file_path, bool passed, double elapsed_time) {
-    if (g_output_file == NULL) {
-        qCritical() << "Output file not initialized";
         return;
     }
     
-    // Write elapsed time at the end
-    fprintf(g_output_file, "\nElapsed Time: %.2f seconds\n", elapsed_time);
-    fclose(g_output_file);
-    g_output_file = NULL;
+    // Write content to file
+    fprintf(out_file, "Timestamp: %s\n", timestamp.toLocal8Bit().constData());
+    fprintf(out_file, "File: %s\n", edf_file_path);
+    fprintf(out_file, "Elapsed Time: %.2f seconds\n\n", elapsed_time);
+    fprintf(out_file, "Output:\n%s", output_content);
     
-    // Rename file with appropriate extension
-    QFileInfo file_info(edf_file_path);
-    QString base_name = file_info.completeBaseName();
-    QString dir_path = file_info.absolutePath();
+    fclose(out_file);
     
-    QString temp_filename = base_name + ".edf_temp";
-    QString result_ext = passed ? ".edf_pass" : ".edf_fail";
-    QString final_filename = base_name + result_ext;
-    
-    QString temp_fullpath = QDir(dir_path).filePath(temp_filename);
-    QString final_fullpath = QDir(dir_path).filePath(final_filename);
-
-    // Remove existing file if it exists
-    if (QFile::exists(final_fullpath)) {
-        QFile::remove(final_fullpath);
-    }
-    
-    // Rename temp file to final result file
-    if (QFile::rename(temp_fullpath, final_fullpath)) {
-        qDebug() << "Result saved to:" << final_fullpath;
-    } else {
-        qCritical() << "Failed to rename temporary file to:" << final_fullpath;
-    }
+    qDebug() << "Result saved to:" << out_fullpath;
 }
 
-// Replace tee_printf with direct file writing
-void file_printf(const char* format, ...) {
-    if (g_output_file == NULL) {
-        // If output file isn't open, just print to console
-        va_list args;
-        va_start(args, format);
-        vprintf(format, args);
-        va_end(args);
-        return;
+// Function to capture stdout to a string buffer
+class StdoutCapture {
+public:
+    StdoutCapture() {
+        original_stdout = stdout;
+#ifdef _WIN32
+        tmpfile_path = std::tmpnam(nullptr);
+        freopen_s(&capture_file, tmpfile_path.c_str(), "w", stdout);
+#else
+        capture_file = tmpfile();
+        stdout = capture_file;
+#endif
     }
     
-    // Print to both console and file
-    va_list args1, args2;
-    va_start(args1, format);
-    va_copy(args2, args1);
+    ~StdoutCapture() {
+        fflush(stdout);
+        stdout = original_stdout;
+        if (capture_file) {
+            fclose(capture_file);
+        }
+    }
     
-    // Print to console
-    vprintf(format, args1);
+    std::string get_output() {
+        fflush(stdout);
+        std::string output;
+        
+#ifdef _WIN32
+        fclose(capture_file);
+        FILE* read_file;
+        fopen_s(&read_file, tmpfile_path.c_str(), "r");
+        if (read_file) {
+            char buffer[4096];
+            while (fgets(buffer, sizeof(buffer), read_file) != NULL) {
+                output += buffer;
+            }
+            fclose(read_file);
+            remove(tmpfile_path.c_str());
+        }
+#else
+        rewind(capture_file);
+        char buffer[4096];
+        while (fgets(buffer, sizeof(buffer), capture_file) != NULL) {
+            output += buffer;
+        }
+#endif
+        
+        return output;
+    }
     
-    // Print to file
-    vfprintf(g_output_file, format, args2);
-    fflush(g_output_file);  // Ensure it's written immediately
-    
-    va_end(args1);
-    va_end(args2);
-}
+private:
+    FILE* original_stdout;
+    FILE* capture_file;
+#ifdef _WIN32
+    std::string tmpfile_path;
+#endif
+};
 
-// Updated main function with direct file output changes
 int main(int argc, char *argv[]) {
 #if defined(_MSC_VER) || defined(_MSC_FULL_VER) || defined(_MSC_BUILD)
 #error "Wrong compiler or platform!"
@@ -196,6 +192,7 @@ int main(int argc, char *argv[]) {
         (sizeof(long long) != 8) || (sizeof(float) != 4) ||
         (sizeof(double) != 8)) {
         fprintf(stderr, "Wrong compiler or platform!\n");
+        qCritical() << "Wrong compiler or platform!\n";
         return EXIT_FAILURE;
     }
 
@@ -206,19 +203,20 @@ int main(int argc, char *argv[]) {
         (byte_order_test_var.four[2] != 2) ||
         (byte_order_test_var.four[3] != 3)) {
         fprintf(stderr, "Wrong compiler or platform!\n");
+        qCritical() << "Wrong compiler or platform!\n";
         return EXIT_FAILURE;
     }
 
 #if defined(__LP64__)
     if (sizeof(long) != 8) {
         fprintf(stderr, "Wrong compiler or platform!\n");
-        qCritical() << "Wrong compiler or platform!\n";
+        qCritical () << "Wrong compiler or platform!\n";
         return EXIT_FAILURE;
     }
 #else
     if (sizeof(long) != 4) {
         fprintf(stderr, "Wrong compiler or platform!\n");
-        qCritical() << "Wrong compiler or platform!\n";
+        qCritical () << "Wrong compiler or platform!\n";
         return EXIT_FAILURE;
     }
 #endif
@@ -226,7 +224,7 @@ int main(int argc, char *argv[]) {
 #if defined(__MINGW64__)
     if (sizeof(long) != 4) {
         fprintf(stderr, "Wrong compiler or platform!\n");
-        qCritical() << "Wrong compiler or platform!\n";
+        qCritical () << "Wrong compiler or platform!\n";
         return EXIT_FAILURE;
     }
 #endif
@@ -252,15 +250,14 @@ int main(int argc, char *argv[]) {
             qWarning() << "Found the argument";
             if(argc < 3)
             {
-                fprintf(stderr, "Error: No filename specified for compatibility check\n");
-                qCritical() << "Error: No filename specified for compatibility check";
+                qCritical() << "Error: No filename specified for compatibility check\n";
+                qCritical() << "Usage: edfbrowser --check-compatibility filename.edf\n";
                 return EXIT_FAILURE;
             }
 
             // Check if file exists before proceeding
             QFileInfo check_file(argv[2]);
             if (!check_file.exists() || !check_file.isFile()) {
-                fprintf(stderr, "Error: File does not exist or is not a regular file: %s\n", argv[2]);
                 qCritical() << "Error: File does not exist or is not a regular file:" << argv[2];
                 return EXIT_FAILURE;
             }
@@ -271,7 +268,7 @@ int main(int argc, char *argv[]) {
             QString pass_file = QDir(dir_path).filePath(base_name + ".edf_pass");
             QString fail_file = QDir(dir_path).filePath(base_name + ".edf_fail");
             
-            if (QFileInfo::exists(pass_file) || QFileInfo::exists(fail_file)) {                
+            if (QFileInfo::exists(pass_file) || QFileInfo::exists(fail_file)) {
                 qDebug() << "Skipping (already processed):" << argv[2];
                 return EXIT_SUCCESS;
             }
@@ -279,76 +276,71 @@ int main(int argc, char *argv[]) {
             // Start timing
             auto start_time = std::chrono::high_resolution_clock::now();
 
-            // Initialize output file
-            if (!init_output_file(argv[2])) {
-                return EXIT_FAILURE;
-            }
-
             FILE *inputfile;
             char txt_string[2048];
             edfhdrblck_t *edfhdr;
 
-            file_printf("Opening input file: %s\n", argv[2]);
-            qDebug() << "Opening input file:" << argv[2];
-            
+            qDebug() << "Opening input file: " << argv[2];
             inputfile = fopen(argv[2], "rb");
             if(inputfile == NULL)
             {
-                file_printf("Error: Cannot open file '%s'\n", argv[2]);
-                qCritical() << "Error: Cannot open file:" << argv[2];
-                finalize_output_file(argv[2], false, 0.0);
+                qCritical() << "Error: Cannot open file '"<<  argv[2] << "'\r\n";
                 return EXIT_FAILURE;
             }
             
             txt_string[0] = 0;
             char str1_2048[2048]={""};
 
-            file_printf("Starting EDF compatibility check for: %s\n", argv[2]);
+            // Start capturing stdout
+            StdoutCapture stdout_capture;
 
-            edfhdr = check_edf_file(inputfile, str1_2048, 2048, 0, 0);  // Parse header
+            edfhdr = check_edf_file(inputfile, str1_2048, 2048, 0, 0);  // You still need this to parse header
 
             if (edfhdr == NULL) {
                 fclose(inputfile);
-                file_printf("Error: %s\n", str1_2048);
-                qCritical() << "Error:" << str1_2048;
+                qCritical() << "Error: " << str1_2048 << "\r\n";
+                
+                // Capture output content
+                std::string output_content = stdout_capture.get_output() + 
+                                            std::string("Error: ") + str1_2048;
                 
                 // Calculate elapsed time
                 auto end_time = std::chrono::high_resolution_clock::now();
                 double elapsed = std::chrono::duration<double>(end_time - start_time).count();
                 
-                // Finalize and rename output file
-                finalize_output_file(argv[2], false, elapsed);
+                // Save failure result
+                save_check_result(argv[2], false, output_content.c_str(), elapsed);
                 
                 return EXIT_FAILURE;
             }
 
             char compat_err[2048] = {0};
             int result = check_edf_compatibility(edfhdr, inputfile, compat_err, sizeof(compat_err));
-
+            
             // Determine if compatibility check passed
             bool check_passed = (result == 0);
             
-            // Write detailed results directly to the file
+            // Generate output content for details
             if (check_passed) {
-                file_printf("Compatibility check passed: File is a valid %s%s file.\n",
+                fprintf(stdout, "Compatibility check passed: File is a valid %s%s file.\n",
                         edfhdr->edf ? "EDF" : "BDF", edfhdr->edfplus || edfhdr->bdfplus ? "+" : "");
-
-                file_printf("Number of signals: %i\n", edfhdr->edfsignals);
-
-                file_printf("Number of data records: %lli\n", edfhdr->datarecords);
-
-                file_printf("Recording duration: %d seconds\n", edfhdr->recording_len_sec);
+                fprintf(stdout, "Number of signals: %i\n", edfhdr->edfsignals);
+                fprintf(stdout, "Number of data records: %lli\n", edfhdr->datarecords);
+                fprintf(stdout, "Recording duration: %d seconds\n", edfhdr->recording_len_sec);
             } else {
-                file_printf("Compatibility check failed: File is NOT a valid EDF or BDF file.\n");
-                file_printf("Error: %s\n", compat_err);
+                fprintf(stdout, "Compatibility check failed: File is NOT a valid EDF or BDF file.\n");
+                fprintf(stdout, "Error: %s\n", compat_err);
             }
+
+            // Capture all output content
+            std::string output_content = stdout_capture.get_output();
             
             // Calculate elapsed time
             auto end_time = std::chrono::high_resolution_clock::now();
             double elapsed = std::chrono::duration<double>(end_time - start_time).count();
             
-            // Finalize and rename output file
-            finalize_output_file(argv[2], check_passed, elapsed);
+            // Save result to file
+            save_check_result(argv[2], check_passed, output_content.c_str(), elapsed);
 
             // Clean up
             free(edfhdr->edfparam);
@@ -358,7 +350,9 @@ int main(int argc, char *argv[]) {
             qDebug() << "Check completed!";
             return check_passed ? EXIT_SUCCESS : EXIT_FAILURE;
         }
-        
+        else
+        {
+            qDebug("Proceed to opening the file if it exists");
 
             QString filePath = args.at(1);
             QFileInfo fileInfo(filePath);
@@ -497,7 +491,7 @@ int main(int argc, char *argv[]) {
     delete MainWindow;
 
     qDebug() << "Checked successfully!";
-    return EXIT_SUCCESS;
+    return ret;
 }
 
 void UI_Mainwindow::showEvent(QShowEvent *event) {

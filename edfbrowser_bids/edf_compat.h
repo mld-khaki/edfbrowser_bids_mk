@@ -39,7 +39,6 @@
 #include <string.h>
 
 #include "global.h"
-#include "mainwindow.h"
 #include "utils.h"
 
 
@@ -74,10 +73,33 @@ private:
 private slots:
 
   void CheckButtonClicked();
+  void CheckButtonClicked_prv();
 
 };
+int is_onset_number_free(char *str);
+int is_duration_number_free(char *str);
+int check_edf_compatibility(edfhdrblck_t *hdr, FILE *inputfile, char *errmsg, int errmsg_len);
 
 
+class StdoutCapture {
+public:
+    StdoutCapture();
+
+    ~StdoutCapture();
+
+    // Record a line to the capture file without redirecting stdout
+    void record(const char* format, ...);
+    std::string get_output();
+
+private:
+    FILE* original_stdout;
+    FILE* capture_file = nullptr;
+#ifdef _WIN32
+    char temp_filename[L_tmpnam];
+#endif
+};
+
+int tee_printf(const char* format, ...);
 
 #endif // EDFCOMPATFORM1_H
 
