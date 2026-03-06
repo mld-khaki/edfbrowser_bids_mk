@@ -1,1 +1,4 @@
 /edfbrowser_bids/build/
+*.log
+*.csv
+*.edf
